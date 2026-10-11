@@ -5,8 +5,9 @@ Opt-in, per-stage acceleration of one model stage on Rockchip RK3588/RK3576/RK35
 different project. Here a single model stage that already computes through its own graph and
 `ExecutionContext` is routed to a pre-compiled RKNN network instead of ggml.
 
-Currently implemented for one family: the `qwen3_tts` speech tokenizer decoder (the vocoder,
-codes to PCM). Everything below is measured on an Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55).
+Currently implemented for two families: the `qwen3_tts` speech tokenizer decoder (the vocoder,
+codes to PCM) and the `piper_tts` VITS decoder (latent to PCM). Everything below is measured on an
+Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55).
 
 ## Requirements
 
@@ -89,6 +90,41 @@ A `.rknn` is compiled per target SoC and is not portable between chips. The grap
 `--target` accepts the RKNPU2 platforms the toolkit knows, but only `rk3588` has been built and
 measured here; the others are untested, not unsupported.
 
+### Piper (VITS) decoder
+
+`tools/prepare_piper_tts_rknn_vocoder.py` slices a Piper voice ONNX at the seam the runtime already
+has — the inverse-flow input `z [1,192,N]` and its frame mask `y_mask [1,1,N]` (plus `g` for a
+multi-speaker voice) — checks the fixed-window decode against a full-length decode, and compiles
+the slice:
+
+```bash
+<export-venv>/bin/python tools/prepare_piper_tts_rknn_vocoder.py \
+  --voice-onnx en_US-lessac-medium.onnx --skip-rknn --output decoder_z.onnx
+<converter-venv>/bin/python tools/prepare_piper_tts_rknn_vocoder.py \
+  --onnx decoder_z.onnx --target rk3588
+```
+
+The seam is the flow input and not the input of `dec.conv_pre`: the flow belongs to the decoder
+half, and the runtime's latent is the pre-flow one. Slicing at `conv_pre` compiles a decoder that
+expects post-flow samples and feeds it pre-flow ones, which is quiet mush (measured: output RMS
+4x low, no intelligible speech).
+
+RKNN has no dynamic shapes, so the engine is compiled for one window of 93 latent slices and the
+runtime walks the latent over it: 45 slices emitted per step, 24 slices of real context on each
+side, a short window zero-padded and mask-zeroed at the end that has no data, and the window that
+reaches the end of the latent extends its left context to fill the window. The 24 is measured, not
+inherited: at the 45+5+5 window paroli ships, interior windows score 8-60 dB against a
+full-length decode (93: 98+ dB, 77: 51+ dB). The mask is 1 over the real slices and 0 over the
+padding — the flow multiplies its activations by the mask after every convolution, so a padded
+frame marked 1 propagates its conv biases into the real frames and costs 10-20 dB there.
+
+The last slices of the latent are the one thing a fixed-shape window cannot reproduce: a
+full-length decode has the end of the tensor there, where a window has padding, and a conv layer
+two levels deep reads the pad's own conv output (nonzero, from the biases) where the full decode
+reads the implicit zeros past the tensor end. No mask value in the padding fixes it. Measured: the
+last ~7 slices of a short latent land 20-40 dB off, the interior windows are exact. paroli ships
+the same trade.
+
 ## Verified
 
 - Export stage: stepwise-vs-full-decode self-check 111.4 dB at B=64 and 103.7 dB at B=16,
@@ -112,6 +148,18 @@ measured here; the others are untested, not unsupported.
 small-batch model, which is what cuts time-to-first-audio. When the RKNN decoder is active the
 ggml decoder weights are not loaded at all, which is where most of the memory saving comes from.
 
+Piper takes one option and is offline only:
+
+```bash
+./build/bin/audiocpp_cli --task tts --family piper_tts \
+  --model models/Piper-TTS-GGUF/piper-en-us-lessac-medium-orig.gguf \
+  --text "..." --text-chunk-size 60 --out out.wav \
+  --session-option piper_tts.rknn_decoder=/root/tts-rknn/piper-lessac-w93.rknn
+```
+
+The engine is per voice: a `.rknn` compiled from lessac's latent is validated against the loaded
+voice's channel count at init and fails with a message naming the producer if it does not match.
+
 ## Measured on RK3588
 
 300 Russian characters, greedy decoding, `conv_weight_type=f16`, all other stages on CPU:
@@ -129,6 +177,35 @@ tokens in every window, while the stateful model voices each token once.
 Quality: offline ggml-vs-RKNN output SNR 27 dB, with the per-second dips confined to
 near-silence (the fp16 noise floor), and no discontinuity at the group boundaries. The two
 batch sizes agree to 57 dB.
+
+### Piper, measured on the same board
+
+`piper-en-us-lessac-medium-orig.gguf`, 443 characters at `--text-chunk-size 60` (10 chunks,
+25.18 s of audio), seed 1234:
+
+| path | RTF | peak RSS | decoder ms |
+|---|---|---|---|
+| ggml decoder | 0.198 | 299 MB | 2070 |
+| RKNN decoder (93-slice window) | 0.0696 | 175 MB | 1030 |
+
+2.85x wall, 2.0x on the decoder itself (0.95 → 0.46 ms per emitted slice), -42% RSS. The
+decoder-side headroom is smaller than the projection from paroli's numbers because the window
+carries 24+24 slices of context for 45 emitted slices, and this board's ggml VITS decoder is
+already fast (RTF 0.20).
+
+Quality: ggml-vs-RKNN output SNR 24.1 dB global, 40 dB median per 256-sample slice, no alignment
+drift (best lag 0 samples in every window), and the max sample-to-sample step is unchanged
+(13384 vs 13412), so no seam clicks. The dips are near-silence (LSB noise) and one loud plosive
+onset, i.e. the fp16 noise floor, not the stitching.
+
+## NPU core use
+
+`rknn.config` in 2.3.2 has no `core_num` (it has `single_core_mode`), so an engine is built
+multi-core and the runtime core mask decides. `RKNN_NPU_CORE_AUTO` lets the driver pick, and for
+graphs this small it picks one core: `/sys/kernel/debug/rknpu/load` stays at `NPU load: Core0:
+100%` for the whole run. The `piper_tts` sidecar asks for `RKNN_NPU_CORE_0_1_2` explicitly and
+falls back to `AUTO` if the driver rejects it (single-core SoCs do); the `qwen3_tts` sidecar keeps
+`AUTO`, where the vocoder is big enough that the driver spreads it.
 
 ## What this path is not for
 

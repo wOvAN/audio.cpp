@@ -23,6 +23,7 @@ namespace engine::models::qwen3_tts {
 
 namespace {
 
+#if defined(ENGINE_HAVE_RKNN)
 using Clock = std::chrono::steady_clock;
 
 constexpr int64_t kSampleRate = 24000;
@@ -49,6 +50,7 @@ std::vector<char> read_file(const std::string & path) {
     }
     return data;
 }
+#endif
 
 }  // namespace
 

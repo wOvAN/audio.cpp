@@ -1,5 +1,6 @@
 #include "engine/community_models/piper_tts/vits_runtime.h"
 
+#include "engine/community_models/piper_tts/rknn_decoder.h"
 #include "engine/framework/assets/tensor_source.h"
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -36,9 +37,12 @@ namespace core = engine::core;
 namespace modules = engine::modules;
 
 constexpr size_t kIoArenaBytes = 1ULL * 1024ULL * 1024ULL;
-constexpr size_t kDurationGraphArenaBytes = 16ULL * 1024ULL * 1024ULL;
+// Device graph arenas are sized for the CPU backend, which keeps tensor payloads
+// outside the ggml context. Vulkan allocates the graph objects in the same arena,
+// and the unrolled VITS decoder graph needs >16 MiB there.
+constexpr size_t kDurationGraphArenaBytes = 32ULL * 1024ULL * 1024ULL;
 constexpr size_t kDurationFlowGraphArenaBytes = 4ULL * 1024ULL * 1024ULL;
-constexpr size_t kDecoderGraphArenaBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr size_t kDecoderGraphArenaBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr size_t kWeightArenaBytes = 16ULL * 1024ULL * 1024ULL;
 constexpr int64_t kMaxLatentFrames = 4000;
 constexpr float kLeakyReluSlope = 0.1F;
@@ -1258,7 +1262,8 @@ struct PiperVitsRuntime::State {
 
     State(
         std::shared_ptr<const PiperTtsAssets> assets_in,
-        core::BackendConfig backend_config)
+        core::BackendConfig backend_config,
+        std::string rknn_decoder_path)
         : assets(std::move(assets_in)),
           threads(std::max(1, backend_config.threads)) {
         if (assets == nullptr) {
@@ -1269,6 +1274,16 @@ struct PiperVitsRuntime::State {
         backend_type = core::backend_type(backend.value);
         core::set_backend_threads(backend.value, threads);
         weights = load_weights(assets, backend.value, backend_type);
+        if (!rknn_decoder_path.empty()) {
+            int64_t samples_per_slice = 1;
+            for (const int64_t rate : assets->config.upsample_rates) {
+                samples_per_slice *= rate;
+            }
+            rknn = std::make_unique<PiperTtsRknnDecoder>(
+                rknn_decoder_path,
+                assets->config.inter_channels,
+                samples_per_slice);
+        }
         if (backend_type == core::BackendType::Cuda) {
             // Host duration alignment prevents small TF32 differences from being
             // amplified by monotone expansion while the expensive decoder stays on CUDA.
@@ -1379,12 +1394,17 @@ struct PiperVitsRuntime::State {
     std::array<runtime::CacheSlots<int64_t, std::unique_ptr<DurationFlowGraph>>, 3>
         duration_flow_graphs;
     runtime::CacheSlots<int64_t, std::unique_ptr<DecoderGraph>> decoder_graphs{2};
+    std::unique_ptr<PiperTtsRknnDecoder> rknn;
 };
 
 PiperVitsRuntime::PiperVitsRuntime(
     std::shared_ptr<const PiperTtsAssets> assets,
-    core::BackendConfig backend_config)
-    : state_(std::make_unique<State>(std::move(assets), backend_config)) {}
+    core::BackendConfig backend_config,
+    std::string rknn_decoder_path)
+    : state_(std::make_unique<State>(
+          std::move(assets),
+          backend_config,
+          std::move(rknn_decoder_path))) {}
 
 PiperVitsRuntime::~PiperVitsRuntime() = default;
 
@@ -1474,23 +1494,30 @@ runtime::AudioBuffer PiperVitsRuntime::synthesize(
         stats,
         log_duration,
         options);
-    auto decoder_start = std::chrono::steady_clock::now();
-    auto & decoder_graph = state_->decoder_graph(prior.frames);
-    core::write_tensor_f32(
-        core::wrap_tensor(
-            decoder_graph.latent,
-            core::TensorShape::from_dims({
-                1,
-                state_->assets->config.inter_channels,
-                prior.frames,
-            }),
-            GGML_TYPE_F32),
-        prior.latent);
-    compute_graph(decoder_graph, "Piper TTS decoder");
+    const auto decoder_start = std::chrono::steady_clock::now();
     runtime::AudioBuffer out;
     out.sample_rate = static_cast<int>(state_->assets->config.sample_rate);
     out.channels = 1;
-    out.samples = core::read_tensor_f32(decoder_graph.waveform);
+    if (state_->rknn != nullptr) {
+        out.samples = state_->rknn->decode(
+            prior.latent.data(),
+            state_->assets->config.inter_channels,
+            prior.frames);
+    } else {
+        auto & decoder_graph = state_->decoder_graph(prior.frames);
+        core::write_tensor_f32(
+            core::wrap_tensor(
+                decoder_graph.latent,
+                core::TensorShape::from_dims({
+                    1,
+                    state_->assets->config.inter_channels,
+                    prior.frames,
+                }),
+                GGML_TYPE_F32),
+            prior.latent);
+        compute_graph(decoder_graph, "Piper TTS decoder");
+        out.samples = core::read_tensor_f32(decoder_graph.waveform);
+    }
     engine::debug::timing_log_scalar(
         "piper_tts.decoder_ms",
         engine::debug::elapsed_ms(decoder_start));
