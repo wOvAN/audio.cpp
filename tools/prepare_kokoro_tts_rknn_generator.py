@@ -108,6 +108,9 @@ class Generator(torch.nn.Module):
         # None evaluates `sin` exactly; a list of the minimax coefficients (fit on
         # [-clip, clip], powers 1,3,5,7,9) is the exported form.
         self.sin_form = None
+        # With a coefficient list, True folds the argument into [-pi, pi] before the
+        # polynomial (rewrite_sin_range_reduced) instead of clipping it (the shipped form).
+        self.sin_reduce = False
 
     # --- blocks -------------------------------------------------------------
 
@@ -166,7 +169,15 @@ class Generator(torch.nn.Module):
         if self.sin_form is None:
             return torch.sin(argument)
         coeffs = self.sin_form
-        clipped = argument.clamp(-clip, clip)
+        if self.sin_reduce:
+            # The fold of rewrite_sin_range_reduced: k = floor(x/(2*pi) + 0.5),
+            # xr = x - k*2*pi, so the polynomial sees |xr| <= pi and never a clamped
+            # argument.
+            clipped = argument - (2.0 * math.pi) * torch.floor(
+                argument * (1.0 / (2.0 * math.pi)) + 0.5
+            )
+        else:
+            clipped = argument.clamp(-clip, clip)
         square = clipped * clipped
         acc = clipped.new_tensor(coeffs[-1])
         for coefficient in reversed(coeffs[:-1]):
@@ -401,6 +412,7 @@ def check_onnx(
     onnx_path: Path,
     sin_degree: int = 7,
     clip: float = 3.14159,
+    sin_reduce: bool = False,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Run the exported graph on the last window of the runtime's walk and compare it with
     the same window in torch. This is the gate for the export path itself — the tracer, the
@@ -432,8 +444,10 @@ def check_onnx(
         model.sin_form = (
             sin_polynomial_coeffs(sin_degree, clip) if sin_degree >= 3 else None
         )
+        model.sin_reduce = sin_reduce
         reference = model(xw, hw, style, mid, mask_out)
         model.sin_form = None
+        model.sin_reduce = False
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     feeds = {
         name: tensor.numpy()
@@ -485,6 +499,33 @@ def sin_polynomial_coeffs(degree: int, clip: float) -> list[float]:
     return [float(poly[power] / clip**power) for power in (1, 3, 5, 7, 9) if power <= degree]
 
 
+def horner_sin_nodes(base: str, argument: str, target: str, powers, coeffs, constant) -> list:
+    """The Horner chain of the odd polynomial on `argument`, writing the product into
+    `target`. Shared by the two sin rewrites so they are the same polynomial."""
+    from onnx import helper
+
+    x2 = f"{base}/x2"
+    new = [helper.make_node("Mul", [argument, argument], [x2], name=f"{base}/x2")]
+    # Horner from the top coefficient down, one running accumulator, so the
+    # fine-rate tensor is written once per step instead of materialising x^3/x^5/x^7.
+    acc = constant(f"{base}/c{powers[-1]}", coeffs[-1])
+    for index in range(len(powers) - 2, -1, -1):
+        power = powers[index]
+        mul = f"{base}/h_mul_{power}"
+        new.append(helper.make_node("Mul", [x2, acc], [mul], name=f"{base}/H_Mul_{power}"))
+        acc = f"{base}/h_add_{power}"
+        new.append(
+            helper.make_node(
+                "Add",
+                [constant(f"{base}/c{power}", coeffs[index]), mul],
+                [acc],
+                name=f"{base}/H_Add_{power}",
+            )
+        )
+    new.append(helper.make_node("Mul", [argument, acc], [target], name=f"{base}/H_x"))
+    return new
+
+
 def rewrite_sin_polynomial(model, degree: int = 7, clip: float = 3.14159) -> int:
     """Snake1d's `sin` -> clipped minimax odd polynomial, in ONNX.
 
@@ -525,25 +566,7 @@ def rewrite_sin_polynomial(model, degree: int = 7, clip: float = 3.14159) -> int
         hi = constant(f"{base}/hi", clip)
         clipped = f"{base}/clip"
         new = [helper.make_node("Clip", [source, lo, hi], [clipped], name=f"{base}/Clip")]
-        x2 = f"{base}/x2"
-        new.append(helper.make_node("Mul", [clipped, clipped], [x2], name=f"{base}/x2"))
-        # Horner from the top coefficient down, one running accumulator, so the
-        # fine-rate tensor is written once per step instead of materialising x^3/x^5/x^7.
-        acc = constant(f"{base}/c{powers[-1]}", coeffs[-1])
-        for index in range(len(powers) - 2, -1, -1):
-            power = powers[index]
-            mul = f"{base}/h_mul_{power}"
-            new.append(helper.make_node("Mul", [x2, acc], [mul], name=f"{base}/H_Mul_{power}"))
-            acc = f"{base}/h_add_{power}"
-            new.append(
-                helper.make_node(
-                    "Add",
-                    [constant(f"{base}/c{power}", coeffs[index]), mul],
-                    [acc],
-                    name=f"{base}/H_Add_{power}",
-                )
-            )
-        new.append(helper.make_node("Mul", [clipped, acc], [target], name=f"{base}/H_x"))
+        new += horner_sin_nodes(base, clipped, target, powers, coeffs, constant)
         position = list(model.graph.node).index(node)
         model.graph.node.remove(node)
         for offset, created in enumerate(new):
@@ -551,7 +574,73 @@ def rewrite_sin_polynomial(model, degree: int = 7, clip: float = 3.14159) -> int
     return len(nodes)
 
 
-def export_onnx(model: Generator, window: int, output: Path, sin_degree: int = 7) -> None:
+def rewrite_sin_range_reduced(model, degree: int = 7, clip: float = 3.14159) -> int:
+    """Snake1d's `sin` -> range-reduced minimax odd polynomial, in ONNX (`--sin-reduce`).
+
+    The shipped rewrite clips its argument at ±pi, and the clip, not the fit, is the
+    30.4 dB floor: measured over the 49M Snake arguments of a 200-frame decode, 1.6%
+    are past pi (max 20.5), and degrees 5, 7 and 9 all measure the same 17.6 dB
+    sine-level SNR. This form folds the argument into the fundamental domain with
+    k = Floor(x/(2*pi) + 0.5); xr = x - k*2*pi (Mul/Add/Floor/Mul/Sub, all
+    NPU-native) and evaluates the same minimax fit on the folded argument, where it
+    is valid: 41.7 dB at degree 5, 70.5 at 7, 103.1 at 9. Costs 4 extra full-tensor
+    elementwise ops per Snake on a graph whose NPU time is 84% elementwise.
+    """
+    import numpy as np
+    from onnx import helper, numpy_helper
+
+    nodes = [node for node in list(model.graph.node) if node.op_type == "Sin"]
+    if not nodes:
+        return 0
+    powers = [power for power in (1, 3, 5, 7, 9) if power <= degree]
+    if not powers:
+        return 0
+    coeffs = sin_polynomial_coeffs(degree, clip)
+
+    def constant(name: str, value) -> str:
+        model.graph.initializer.append(
+            numpy_helper.from_array(np.array(value, np.float32), name)
+        )
+        return name
+
+    for node in nodes:
+        source, target = node.input[0], node.output[0]
+        base = node.name or target
+        k = f"{base}/fold_k"
+        reduced = f"{base}/fold_xr"
+        new = [
+            helper.make_node(
+                "Mul",
+                [source, constant(f"{base}/inv_2pi", 1.0 / (2.0 * math.pi))],
+                [f"{base}/fold_scaled"],
+                name=f"{base}/Fold_Mul",
+            ),
+            helper.make_node(
+                "Add",
+                [f"{base}/fold_scaled", constant(f"{base}/half", 0.5)],
+                [f"{base}/fold_shift"],
+                name=f"{base}/Fold_Add",
+            ),
+            helper.make_node("Floor", [f"{base}/fold_shift"], [k], name=f"{base}/Fold_Floor"),
+            helper.make_node(
+                "Mul",
+                [k, constant(f"{base}/two_pi", 2.0 * math.pi)],
+                [f"{base}/fold_k2pi"],
+                name=f"{base}/Fold_K",
+            ),
+            helper.make_node("Sub", [source, f"{base}/fold_k2pi"], [reduced], name=f"{base}/Fold_Sub"),
+        ]
+        new += horner_sin_nodes(base, reduced, target, powers, coeffs, constant)
+        position = list(model.graph.node).index(node)
+        model.graph.node.remove(node)
+        for offset, created in enumerate(new):
+            model.graph.node.insert(position + offset, created)
+    return len(nodes)
+
+
+def export_onnx(
+    model: Generator, window: int, output: Path, sin_degree: int = 7, sin_reduce: bool = False
+) -> None:
     scale = model.scale
     args = (
         torch.zeros(1, 512, window),
@@ -580,7 +669,14 @@ def export_onnx(model: Generator, window: int, output: Path, sin_degree: int = 7
         onnx.save(graph, str(output))
         sidecar.unlink()
     graph = onnx.load(str(output))
-    rewritten = rewrite_sin_polynomial(graph, sin_degree) if sin_degree >= 3 else 0
+    if sin_degree >= 3:
+        rewritten = (
+            rewrite_sin_range_reduced(graph, sin_degree)
+            if sin_reduce
+            else rewrite_sin_polynomial(graph, sin_degree)
+        )
+    else:
+        rewritten = 0
     if rewritten:
         onnx.save(graph, str(output))
     onnx.checker.check_model(str(output))
@@ -640,6 +736,15 @@ def main() -> int:
         help="odd-polynomial degree for Snake1d's sin in the exported graph (0 keeps Sin, "
              "which librknnrt runs on CPU). 5 and 9 measure the same 30.4 dB against the "
              "exact sine: the clip saturation past pi dominates, so take the cheaper fit",
+    )
+    parser.add_argument(
+        "--sin-reduce",
+        action="store_true",
+        help="range-reduce Snake1d's sin (fold to [-pi,pi] with Floor, no Clip) instead of "
+             "clipping it at ±pi. The clip is what sets the 30.4 dB sine floor (measured: "
+             "1.6%% of the Snake arguments of a 200-frame decode are past pi, max 20.5); the "
+             "folded degree-5 fit measures 41.7 dB at the sine and costs 4 extra "
+             "elementwise ops per Snake",
     )
     parser.add_argument("--skip-rknn", action="store_true", help="export and check only")
     parser.add_argument("--skip-check", action="store_true")
@@ -717,11 +822,12 @@ def main() -> int:
 
     for window in args.frames:
         onnx_path = args.output_dir / f"{args.prefix}_w{window}.onnx"
-        export_onnx(model, window, onnx_path, args.sin_degree)
+        export_onnx(model, window, onnx_path, args.sin_degree, args.sin_reduce)
         if not args.skip_check:
             with torch.no_grad():
                 exact, form = check_onnx(
-                    model, x, har, style, window, padding, onnx_path, args.sin_degree
+                    model, x, har, style, window, padding, onnx_path,
+                    args.sin_degree, sin_reduce=args.sin_reduce,
                 )
             print(
                 f"  exported graph, last window: {form[0]:.1f} dB against the graph it was "

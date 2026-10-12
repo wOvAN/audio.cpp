@@ -83,7 +83,7 @@ def decoder_seam(graph) -> tuple[str, str | None]:
     return latent_in, mask
 
 
-def slice_decoder(voice_onnx: Path, output: Path, window: int) -> None:
+def slice_decoder(voice_onnx: Path, output: Path, window: int, dec_mask: bool = False) -> None:
     model = onnx.load(str(voice_onnx))
     latent, mask = decoder_seam(model.graph)
     inputs = [latent] if mask is None else [latent, mask]
@@ -103,6 +103,10 @@ def slice_decoder(voice_onnx: Path, output: Path, window: int) -> None:
             dims[-1].dim_param = "frames"
     for node in sliced.graph.node:
         node.input[:] = [names.get(name, name) for name in node.input]
+    if dec_mask:
+        if mask is None:
+            raise SystemExit("--dec-mask needs a sliced graph with a y_mask input")
+        print(f"dec-mask: injected {mask_decoder_graph(sliced)} mask muls into the decoder half")
     onnx.checker.check_model(sliced, full_check=False)
     onnx.save(sliced, str(output))
     ops: dict[str, int] = {}
@@ -123,6 +127,56 @@ def slice_decoder(voice_onnx: Path, output: Path, window: int) -> None:
         print(f"  note: graph contains {risky}; if rknn.build aborts in fold_constant, "
               "the exporting torch/onnx pair is too new for the toolkit")
     print(f"wrote {output}")
+
+
+def mask_decoder_graph(model) -> int:
+    """Inject `y_mask` multiplications into the decoder half (opt-in `--dec-mask`).
+
+    VITS's dec has no masking, so in a zero-padded window every decoder conv writes its
+    bias-driven output over the padding and the next conv reads that where a full-length
+    decode reads the implicit zeros past the tensor end: the tail window's last ~7 slices
+    land 20-40 dB off. Multiplying every decoder Conv/ConvTranspose output by the mask -
+    the mask itself upsampled nearest by each `dec.ups` stride, so it is at the stage's
+    rate - makes a padded window read zeros exactly where the full decode reads implicit
+    zeros. With mask=1 everywhere (the full decode, and every interior window) each
+    injected Mul is an exact fp32 identity, so the reference decode is unchanged.
+    """
+    graph = model.graph
+    current = "y_mask"
+    rebuilt = []
+    injected = 0
+    for node in graph.node:
+        rebuilt.append(node)
+        if not node.name.startswith("/dec/"):
+            continue
+        if node.op_type == "ConvTranspose":
+            stride = next(a for a in node.attribute if a.name == "strides").ints[0]
+            # Exact nearest upsampling of the mask as an all-ones ConvTranspose1d
+            # (kernel = stride, no bias): the op dec.ups already runs on the NPU. A
+            # Resize node lowers to a target the board runtime rejects (the build
+            # logs `Unkown op target: 0` and the engine outputs garbage there).
+            weight = f"dec_mask_upw_{injected}"
+            graph.initializer.append(helper.make_tensor(
+                weight, TensorProto.FLOAT, [1, 1, stride], [1.0] * stride))
+            rebuilt.append(helper.make_node(
+                "ConvTranspose", [current, weight], [f"dec_mask_up_{injected}"],
+                name=f"dec_mask_upsampler_{injected}",
+                strides=[stride], kernel_shape=[stride], pads=[0, 0]))
+            current = f"dec_mask_up_{injected}"
+        if node.op_type in ("Conv", "ConvTranspose"):
+            out = node.output[0]
+            masked = f"{out}_masked"
+            rebuilt.append(helper.make_node(
+                "Mul", [out, current], [masked], name=f"dec_mask_mul_{injected}"))
+            for consumer in graph.node:
+                consumer.input[:] = [masked if i == out else i for i in consumer.input]
+            for value in graph.output:
+                if value.name == out:
+                    value.name = masked
+            injected += 1
+    del graph.node[:]
+    graph.node.extend(rebuilt)
+    return injected
 
 
 def graph_input_names(onnx_path: Path) -> list[str]:
@@ -423,6 +477,11 @@ def main() -> int:
     parser.add_argument("--window", type=int, default=CHUNK + 2 * PADDING)
     parser.add_argument("--skip-rknn", action="store_true", help="slice and check only")
     parser.add_argument("--skip-check", action="store_true")
+    parser.add_argument(
+        "--dec-mask", action="store_true",
+        help="slice stage: multiply every decoder conv output by the (rate-upsampled) y_mask, "
+             "so a zero-padded tail window reproduces the full decode's implicit-zero end "
+             "(fixes the last ~7 slices of the tail window); the compiled engine carries it")
     args = parser.parse_args()
 
     if args.voice_onnx is None and args.onnx is None:
@@ -433,7 +492,7 @@ def main() -> int:
     sliced = args.onnx
     if args.voice_onnx is not None:
         sliced = args.output if args.output and args.output.suffix == ".onnx" else Path("decoder_z.onnx")
-        slice_decoder(args.voice_onnx, sliced, args.window)
+        slice_decoder(args.voice_onnx, sliced, args.window, args.dec_mask)
     if sliced is None:
         parser.error("--onnx is required (or pass --voice-onnx to slice one)")
     if not args.skip_check:

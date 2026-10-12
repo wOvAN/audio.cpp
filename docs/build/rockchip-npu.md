@@ -129,9 +129,23 @@ frame marked 1 propagates its conv biases into the real frames and costs 10-20 d
 The last slices of the latent are the one thing a fixed-shape window cannot reproduce: a
 full-length decode has the end of the tensor there, where a window has padding, and a conv layer
 two levels deep reads the pad's own conv output (nonzero, from the biases) where the full decode
-reads the implicit zeros past the tensor end. No mask value in the padding fixes it. Measured: the
+reads the implicit zeros past the tensor end. No mask value **in the padding** fixes it, because
+the mask reaches only the flow: the VITS decoder (`conv_pre`, 18 resblock convs, 3 upsamples,
+`conv_post`) is unmasked, so the pad's conv output is what the last real slices read. Measured: the
 last ~7 slices of a short latent land 20-40 dB off, the interior windows are exact. paroli ships
 the same trade.
+
+`--dec-mask` does fix it, by masking inside the decoder: `Mul(y_mask)` after every `/dec/`
+Conv/ConvTranspose, with the mask upsampled by all-ones `ConvTranspose1d` at each `dec.ups` stride
+(8/8/4) so it is the right length at each level. Measured on the tail window: 28.6 → 117.8 dB
+(47-frame latent) and 43.8 → 118.6 dB (30-frame) against a full-length decode, interiors unchanged
+byte for byte, and 4.8 → 45.8 dB for a 47-frame tail window run through `librknnrt` directly. It
+costs +21% window time (RTF 0.0688 → 0.0832 on the 443-character utterance) and changes nothing
+there, because every chunk of that utterance exceeds 69 frames, so no tail window is short: the
+defect is a short-utterance property. A `Resize` node for the mask upsample measures 50-53 dB in
+the PC simulator and -7.9 dB on the board — `Resize` does not lower to a target the board runtime
+accepts, so the upsampler is a `ConvTranspose1d` of all ones (exact nearest, and the same operator
+the decoder already runs on the NPU).
 
 ### Kokoro (iSTFTNet) generator
 
@@ -161,6 +175,18 @@ on the `rk3566` builds: 352 for the Kokoro w128 engine, 355 for the Piper w93 en
 Qwen3 B=64 vocoder) and the `rk3588` builds of all three measure clean on the board. What kills the
 engine is the magnitude — `value: 0x7800` is 30720, four times past the field, repeated ~800k times.
 
+The field is per axis and per op, which is testable: slicing the fine-rate axis inside the graph
+and splitting the inputs and outputs that carry it (so no single op sees more than 8191 columns)
+takes W=256 from 403 587 REGTASK lines to 0, and the re-traced module keeps every gate — 60.5 dB
+against the runtime's generator, 135.6 dB padded-window exactness, 124.4 dB export against torch,
+and 136.6/135.1/136.8/148.9 dB chunked-against-monolithic per span. It does not ship: the
+resulting engine voices fp16-saturated output (117 682 non-finite values out of a 14.85 s
+utterance, contiguous in columns 8329-13872, peak 65440 = fp16 max), and that is not the register
+field, not the input amplitude (identical inf counts at x1.0/0.5/0.25/0.125), not the padding (a
+fully-filled window with an all-ones mask still gives 20 534) and not the AdaIN all-padding divide
+(clamping the count changes the count by 0). A wide window needs that saturation understood first,
+plus a loader that takes 7 inputs and 2 outputs.
+
 Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
 
 - **Weight-norm folded at load.** Left in the graph, `vector_norm` traces to 51 `ReduceL2` nodes
@@ -180,6 +206,17 @@ Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
   alpha-fold is exact algebra and removes one multiply and one divide per Snake; elementwise ops
   are 84% of this graph's NPU time and the convolutions 15%, so removing full-tensor passes is
   where the wall clock is.
+- **Opt-in `--sin-reduce`: range-reduce the Snake sine instead of clipping it.** The clip is what
+  sets the 30.4 dB floor: 1.6% of the 49M Snake arguments of a 200-frame decode are past pi
+  (max 20.5), and the clip evaluates the polynomial on a clamped argument, so degrees 5, 7 and 9
+  all plateau at 17.6 dB sine-level SNR. The fold `k = Floor(x/(2*pi) + 0.5); xr = x - k*2*pi`
+  (Mul/Add/Floor/Mul/Sub, all NPU-native) puts the polynomial on `xr` in [-pi, pi], where the fit
+  is valid: 41.7 dB sine-level at degree 5 (70.5 at 7, 103.1 at 9) and 50.0 dB at the generator
+  output against the exact sine (shipping form: 30.4). On the board the engine is not slower than
+  the clipped one (13231 vs 14377 ms for the same 14.85 s utterance in the same session, RTF
+  1.101 vs 1.195); the two NPU outputs differ by 28.2 dB, i.e. the change is audible, and the
+  CPU-vs-NPU SNR of both (0.46/0.48 dB) is the documented per-window AdaIN renormalization, not
+  the sine. The default export path is unchanged and reproduces the shipping ONNX byte for byte.
 
 The exported graph is checked against the torch graph it was traced from, on the last window of
 the runtime's walk, with the torch reference evaluated in the same sine form (124.6 dB), so the
