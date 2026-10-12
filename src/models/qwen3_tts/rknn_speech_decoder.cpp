@@ -74,10 +74,18 @@ struct RknnSpeechDecoder::Impl {
             if (ret != 0) {
                 throw std::runtime_error(rknn_status("rknn_init", ret));
             }
-            // AUTO is the multi-core mode on RK3588; an explicit 0_1_2 mask is
-            // rejected for these graphs and falls back to a single core.
-            if (const int m = rknn_set_core_mask(ctx, RKNN_NPU_CORE_AUTO); m != 0) {
+            // Ask for all three cores by name, fall back to AUTO, as the piper and
+            // kokoro sidecars do. Measured here (same binary, both masks, 300 Russian
+            // characters, greedy): AUTO keeps the engine on Core0 (55/0/0 in
+            // /sys/kernel/debug/rknpu/load), 0_1_2 is accepted and spreads it (41/15/16)
+            // for 1.8% on the vocoder (21766 -> 21383 ms). The engine reads its weights
+            // per step, so the step is DRAM-bound, not scheduler-bound: the mask is
+            // right, the headroom is not there.
+            if (const int m = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2); m != 0) {
                 debug::timing_log_scalar("qwen3_tts.speech_decoder.rknn.core_mask_ret", m);
+                if (const int a = rknn_set_core_mask(ctx, RKNN_NPU_CORE_AUTO); a != 0) {
+                    debug::timing_log_scalar("qwen3_tts.speech_decoder.rknn.core_mask_auto_ret", a);
+                }
             }
 
             rknn_input_output_num io_num{};

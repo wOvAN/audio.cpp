@@ -294,12 +294,15 @@ frames or fewer (about 0.9 s) fit one window and are exact.
 ## NPU core use
 
 `rknn.config` in 2.3.2 has no `core_num` (it has `single_core_mode`), so an engine is built
-multi-core and the runtime core mask decides. `RKNN_NPU_CORE_AUTO` lets the driver pick, and for
-graphs this small it picks one core: `/sys/kernel/debug/rknpu/load` stays at `NPU load: Core0:
-100%` for the whole run. The `piper_tts` and `kokoro_tts` sidecars ask for
-`RKNN_NPU_CORE_0_1_2` explicitly and fall back to `AUTO` if the driver rejects it (single-core
-SoCs do); the `qwen3_tts` sidecar keeps `AUTO`, where the vocoder is big enough that the driver
-spreads it.
+multi-core and the runtime core mask decides. `RKNN_NPU_CORE_AUTO` lets the driver pick, and it
+picks one core for every one of these engines: `/sys/kernel/debug/rknpu/load` stays at
+`Core0: 55%, Core1: 0%, Core2: 0%` for the whole `qwen3_tts` vocoder run and at `Core0: 100%` for
+the smaller ones. All three sidecars therefore ask for `RKNN_NPU_CORE_0_1_2` explicitly and fall
+back to `AUTO` if the driver rejects it (single-core SoCs do). What the mask buys is per engine:
+`piper_tts` and `kokoro_tts` get real spread (kokoro Core0 95%, Core1 18%, Core2 19%), and the
+`qwen3_tts` vocoder gets spread too (41/15/16) for 1.8% on the stage (21766 → 21383 ms for 300
+Russian characters, same binary with both masks, greedy) — that engine reads its weights per step,
+so it is DRAM-bound, not scheduler-bound, and the extra cores have no bandwidth to use.
 
 One context per sidecar, and one job per context: the mask spreads a *single* job over the cores
 (kokoro measures Core0 95%, Core1 18%, Core2 19% during a run). Running the windows concurrently

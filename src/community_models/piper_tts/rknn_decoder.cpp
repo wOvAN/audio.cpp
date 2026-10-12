@@ -149,11 +149,17 @@ struct PiperTtsRknnDecoder::Impl {
                 "; compile the engine from this voice (tools/prepare_piper_tts_rknn_vocoder.py)");
         }
         window = static_cast<int64_t>(input.dims[2]);
-        if (window <= kChunk) {
+        // Exact, not a lower bound. A narrower engine (paroli's 45+5+5 = 55-slice
+        // contract compiles from the same seam and passes every other gate) would let
+        // `run_window` copy a 93-slice window into a 55-slice row: overrun into the next
+        // channel and past the end of the latent buffer on the last one.
+        if (window != kChunk + 2 * kPadding) {
             throw std::runtime_error(
                 "Piper TTS decoder RKNN: model " + path + " has a " + std::to_string(window) +
-                "-slice window, which is not wider than the " + std::to_string(kChunk) +
-                "-slice emitted step");
+                "-slice window, expected " + std::to_string(kChunk) + " emitted + 2*" +
+                std::to_string(kPadding) + " context = " + std::to_string(kChunk + 2 * kPadding) +
+                "; compile it with tools/prepare_piper_tts_rknn_vocoder.py --window " +
+                std::to_string(kChunk + 2 * kPadding));
         }
         if (mask_attr.n_elems != static_cast<uint32_t>(window)) {
             throw std::runtime_error(
