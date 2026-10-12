@@ -2,6 +2,7 @@
 #include "cpu_kernels.h"
 
 #include "engine/models/kokoro_tts/assets.h"
+#include "engine/models/kokoro_tts/rknn_generator.h"
 
 #include "engine/framework/audio/dsp.h"
 #include "engine/framework/core/backend.h"
@@ -21,6 +22,8 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <stdexcept>
@@ -59,6 +62,91 @@ std::vector<float> make_zero_tensor_2d(int64_t rows, int64_t cols) {
 
 float & tensor_at(std::vector<float> & values, int64_t row, int64_t col, int64_t cols) {
     return values[tensor_offset_2d(row, col, cols)];
+}
+
+// The predictor's decoder latent as one row-major [rows][cols] block, read out of the
+// predictor's graph tensor when it keeps one.
+std::vector<float> read_decoder_x(const PredictorOutputs & predictor) {
+    if (predictor.decoder_x_tensor == nullptr) {
+        return predictor.decoder_x;
+    }
+    std::vector<float> values(
+        static_cast<size_t>(std::max(int64_t{0}, predictor.decoder_x_rows) *
+                            std::max(int64_t{0}, predictor.decoder_x_cols)),
+        0.0f);
+    const size_t elements = std::min(
+        values.size(), static_cast<size_t>(ggml_nelements(predictor.decoder_x_tensor)));
+    ggml_backend_tensor_get(
+        predictor.decoder_x_tensor, values.data(), 0, elements * sizeof(float));
+    return values;
+}
+
+// Parity harness for the RKNN generator sidecar (docs/build/rockchip-npu.md).
+// With AUDIOCPP_KOKORO_DECODER_DUMP=<dir> the generator's exact inputs and its ggml
+// output are written raw, so tools/prepare_kokoro_tts_rknn_generator.py can check the
+// torch re-implementation it compiles the engine from against this runtime on real
+// data instead of on synthetic latents.
+void write_f32_file(const std::string & path, const std::vector<float> & values) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("kokoro decoder dump: cannot write " + path);
+    }
+    out.write(
+        reinterpret_cast<const char *>(values.data()),
+        static_cast<std::streamsize>(values.size() * sizeof(float)));
+}
+
+void dump_generator_io(
+    const std::string & dir,
+    const std::vector<float> & decoder_x,
+    int64_t decoder_x_cols,
+    const std::vector<float> & conditioning,
+    int64_t conditioning_cols,
+    int64_t conditioning_valid_cols,
+    const std::vector<float> & style,
+    const std::vector<float> & generator_output,
+    int64_t generator_output_cols,
+    const KokoroWeights::GeneratorWeights & generator) {
+    write_f32_file(dir + "/decoder_x.f32", decoder_x);
+    write_f32_file(dir + "/har.f32", conditioning);
+    write_f32_file(dir + "/style.f32", style);
+    write_f32_file(dir + "/generator_out.f32", generator_output);
+    std::ostringstream meta;
+    meta << "{\n"
+         << "  \"decoder_x\": [512, " << decoder_x_cols << "],\n"
+         << "  \"har\": [22, " << conditioning_cols << "],\n"
+         << "  \"har_valid_cols\": " << conditioning_valid_cols << ",\n"
+         << "  \"style\": [" << style.size() << "],\n"
+         << "  \"generator_out\": [22, " << generator_output_cols << "],\n"
+         << "  \"upsample_rates\": [";
+    for (size_t i = 0; i < generator.ups.size(); ++i) {
+        meta << (i == 0 ? "" : ", ") << generator.ups[i].stride;
+    }
+    meta << "],\n  \"upsample_kernel_sizes\": [";
+    for (size_t i = 0; i < generator.ups.size(); ++i) {
+        meta << (i == 0 ? "" : ", ") << generator.ups[i].kernel;
+    }
+    meta << "],\n  \"noise_conv\": [";
+    for (size_t i = 0; i < generator.noise_convs.size(); ++i) {
+        meta << (i == 0 ? "" : ", ") << "[" << generator.noise_convs[i].kernel << ", "
+             << generator.noise_convs[i].stride << ", " << generator.noise_convs[i].padding << "]";
+    }
+    meta << "],\n  \"resblocks\": [";
+    for (size_t i = 0; i < generator.resblocks.size(); ++i) {
+        meta << (i == 0 ? "" : ", ") << "[" << generator.resblocks[i].convs1.size() << ", "
+             << generator.resblocks[i].convs1.front().kernel << "]";
+    }
+    meta << "],\n  \"conv_post\": [" << generator.conv_post.kernel << ", "
+         << generator.conv_post.padding << "],\n"
+         << "  \"gen_istft_n_fft\": " << generator.gen_istft_n_fft << ",\n"
+         << "  \"gen_istft_hop_size\": " << generator.gen_istft_hop_size << ",\n"
+         << "  \"adain_eps\": 1.0e-5\n"
+         << "}\n";
+    std::ofstream out(dir + "/meta.json", std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("kokoro decoder dump: cannot write " + dir + "/meta.json");
+    }
+    out << meta.str();
 }
 
 struct TimeMaskInputs {
@@ -1251,6 +1339,9 @@ struct KokoroIstftNetDecoderRuntime::Impl {
     audio::STFTConfig inverse_stft_config;
     std::unique_ptr<ConditioningGraphRuntime> conditioning_graph;
     GeneratorGraphRuntime generator_graph;
+    // Set by the `kokoro_tts.rknn_generator` session option: the generator stage runs on
+    // the NPU, so the ggml generator graph is never prepared.
+    std::unique_ptr<engine::models::kokoro_tts::KokoroTtsRknnGenerator> rknn_generator;
 
     Impl(
         std::shared_ptr<const KokoroWeights> weights_in,
@@ -1258,7 +1349,8 @@ struct KokoroIstftNetDecoderRuntime::Impl {
         int n_threads_in,
         bool use_device_backend_in,
         uint64_t rng_seed_in,
-        KokoroIstftNetDecoderCapacityContract contract_in)
+        KokoroIstftNetDecoderCapacityContract contract_in,
+        const std::string & rknn_generator_path = {})
         : weights(std::move(weights_in)),
           n_threads(std::max(1, n_threads_in)),
           use_device_backend(use_device_backend_in),
@@ -1273,6 +1365,18 @@ struct KokoroIstftNetDecoderRuntime::Impl {
               audio::STFTFamily::Kokoro,
           }),
           generator_graph(weights->decoder.generator, weights->style_dim, backend, n_threads, use_device_backend) {
+        if (!rknn_generator_path.empty()) {
+            const auto & gen = weights->decoder.generator;
+            int64_t per_frame = gen.gen_istft_hop_size;
+            for (const auto & up : gen.ups) {
+                per_frame *= up.stride;
+            }
+            rknn_generator = std::make_unique<engine::models::kokoro_tts::KokoroTtsRknnGenerator>(
+                rknn_generator_path,
+                int64_t{512},
+                (gen.gen_istft_n_fft / 2 + 1) * 2,
+                per_frame);
+        }
         prepare(contract_in);
     }
 
@@ -1285,6 +1389,11 @@ struct KokoroIstftNetDecoderRuntime::Impl {
             contract.conditioning_frames,
             n_threads,
             use_device_backend);
+        if (rknn_generator != nullptr) {
+            // The generator stage runs on the NPU; its ggml graph, arena and dequantized
+            // weights are all dead weight.
+            return;
+        }
         generator_graph.prepare(
             contract.decoder_frames,
             contract.conditioning_frames);
@@ -1297,14 +1406,16 @@ KokoroIstftNetDecoderRuntime::KokoroIstftNetDecoderRuntime(
     int n_threads,
     bool use_device_backend,
     uint64_t rng_seed,
-    KokoroIstftNetDecoderCapacityContract contract)
+    KokoroIstftNetDecoderCapacityContract contract,
+    const std::string & rknn_generator_path)
     : impl_(std::make_unique<Impl>(
           std::move(weights),
           backend,
           n_threads,
           use_device_backend,
           rng_seed,
-          contract)) {}
+          contract,
+          rknn_generator_path)) {}
 
 KokoroIstftNetDecoderRuntime::~KokoroIstftNetDecoderRuntime() = default;
 
@@ -1330,7 +1441,25 @@ std::vector<float> KokoroIstftNetDecoderRuntime::decode(
     });
 
     std::vector<float> generator_output;
+    int64_t generator_output_cols = 0;
+    const int64_t bins = impl_->inverse_stft_config.n_fft / 2 + 1;
     generator_ms = measure_ms([&]() {
+        if (impl_->rknn_generator != nullptr) {
+            const std::vector<float> decoder_x = read_decoder_x(predictor);
+            // The conditioning is measured in spectrogram columns (60 per latent frame plus
+            // the reflect pad); the generator window is measured in latent frames.
+            const int64_t columns_per_frame = impl_->rknn_generator->columns_per_frame();
+            const int64_t latent_frames = (conditioning->valid_feature_cols - 1) / columns_per_frame;
+            generator_output = impl_->rknn_generator->run(
+                decoder_x.data(),
+                predictor.decoder_x_cols,
+                conditioning->features.data(),
+                conditioning->feature_cols,
+                style_decoder.data(),
+                latent_frames);
+            generator_output_cols = latent_frames * columns_per_frame + 1;
+            return;
+        }
         generator_output = impl_->generator_graph.run(
             predictor.decoder_x,
             predictor.decoder_x_rows,
@@ -1338,12 +1467,28 @@ std::vector<float> KokoroIstftNetDecoderRuntime::decode(
             predictor.decoder_x_tensor,
             *conditioning,
             style_decoder);
+        generator_output_cols = static_cast<int64_t>(generator_output.size()) / bins / 2;
     });
-    const int64_t bins = impl_->inverse_stft_config.n_fft / 2 + 1;
-    const int64_t generated_frames = static_cast<int64_t>(generator_output.size()) / (bins * 2);
+    const int64_t generated_frames = generator_output_cols;
     const int64_t frames = conditioning->valid_feature_cols;
     if (frames <= 0 || frames > generated_frames) {
         throw std::runtime_error("Kokoro decoder valid spectrogram frame count exceeds generated output");
+    }
+    if (const char * dump_dir = std::getenv("AUDIOCPP_KOKORO_DECODER_DUMP"); dump_dir != nullptr) {
+        const double dump_ms = measure_ms([&]() {
+            dump_generator_io(
+                dump_dir,
+                read_decoder_x(predictor),
+                predictor.decoder_x_cols,
+                conditioning->features,
+                conditioning->feature_cols,
+                conditioning->valid_feature_cols,
+                style_decoder,
+                generator_output,
+                generated_frames,
+                impl_->weights->decoder.generator);
+        });
+        engine::debug::timing_log_scalar("kokoro.decoder.dump_ms", dump_ms);
     }
     std::vector<float> waveform;
     istft_ms = measure_ms([&]() {

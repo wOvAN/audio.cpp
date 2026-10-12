@@ -3,6 +3,8 @@
 #include "engine/models/kokoro_tts/predictor.h"
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 typedef struct ggml_backend * ggml_backend_t;
@@ -16,13 +18,16 @@ struct KokoroIstftNetDecoderCapacityContract {
 
 class KokoroIstftNetDecoderRuntime {
 public:
+    // `rknn_generator_path` (optional) routes the generator stage to a pre-compiled
+    // RKNN engine; see engine/models/kokoro_tts/rknn_generator.h.
     KokoroIstftNetDecoderRuntime(
         std::shared_ptr<const KokoroWeights> weights,
         ggml_backend_t backend,
         int n_threads,
         bool use_device_backend,
         uint64_t rng_seed,
-        KokoroIstftNetDecoderCapacityContract contract);
+        KokoroIstftNetDecoderCapacityContract contract,
+        const std::string & rknn_generator_path = {});
     ~KokoroIstftNetDecoderRuntime();
 
     KokoroIstftNetDecoderRuntime(const KokoroIstftNetDecoderRuntime &) = delete;

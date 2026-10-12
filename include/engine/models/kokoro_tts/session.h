@@ -85,6 +85,9 @@ private:
     std::shared_ptr<const engine::model_spec::ModelContract> contract_;
     std::shared_ptr<const kokoro_ggml::KokoroWeights> weights_;
     runtime::GraphCapacityController graph_capacity_controller_;
+    // The `kokoro_tts.rknn_generator` session option: a pre-compiled RKNN engine for
+    // the generator stage. Empty means the ggml generator graph runs on the CPU.
+    std::string rknn_generator_path_;
     int64_t fixed_token_capacity_ = 0;
     int64_t pre_tail_token_capacity_ = 0;
     uint64_t rng_seed_ = 0;

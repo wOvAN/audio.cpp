@@ -29,6 +29,13 @@ constexpr int64_t kDefaultTextChunkSize = 240;
 constexpr const char * kFamily = "kokoro_tts";
 constexpr const char * kModelName = "Kokoro TTS";
 
+// A published GGUF package embeds its own model spec, so an option added to
+// model_specs/kokoro_tts.json is invisible to a package built before it. The NPU
+// generator option is therefore also accepted by name (piper_tts does the same).
+constexpr const char * kPackageIndependentSessionOptions[] = {
+    "kokoro_tts.rknn_generator",
+};
+
 }  // namespace
 
 KokoroTTSSession::KokoroTTSSession(
@@ -46,7 +53,24 @@ KokoroTTSSession::KokoroTTSSession(
     if (contract_ == nullptr) {
         throw std::runtime_error("Kokoro TTS session requires a model contract");
     }
-    runtime::validate_spec_backed_session_options(RuntimeSessionBase::options(), *contract_, kFamily, kModelName);
+    for (const auto & [key, value] : RuntimeSessionBase::options().options) {
+        if (key.rfind(std::string(kFamily) + ".", 0) != 0) {
+            continue;
+        }
+        const bool known = contract_->session_option_keys.find(key) !=
+                               contract_->session_option_keys.end() ||
+            std::any_of(
+                std::begin(kPackageIndependentSessionOptions),
+                std::end(kPackageIndependentSessionOptions),
+                [&](const char * option) { return key == option; });
+        if (!known) {
+            throw std::runtime_error("unknown " + std::string(kModelName) + " session option: " + key);
+        }
+    }
+    if (const auto found = RuntimeSessionBase::options().options.find("kokoro_tts.rknn_generator");
+        found != RuntimeSessionBase::options().options.end()) {
+        rknn_generator_path_ = found->second;
+    }
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Kokoro TTS only supports tts tasks");
     }
@@ -234,7 +258,8 @@ void KokoroTTSSession::prepare_decoder_graph_capacity(int64_t capacity) {
                 threads,
                 use_device_backend,
                 rng_seed_,
-                decoder_contract);
+                decoder_contract,
+                rknn_generator_path_);
         });
     }
     prepared_decoder_capacity_ = capacity;

@@ -5,8 +5,9 @@ Opt-in, per-stage acceleration of one model stage on Rockchip RK3588/RK3576/RK35
 different project. Here a single model stage that already computes through its own graph and
 `ExecutionContext` is routed to a pre-compiled RKNN network instead of ggml.
 
-Currently implemented for two families: the `qwen3_tts` speech tokenizer decoder (the vocoder,
-codes to PCM) and the `piper_tts` VITS decoder (latent to PCM). Everything below is measured on an
+Currently implemented for three families: the `qwen3_tts` speech tokenizer decoder (the vocoder,
+codes to PCM), the `piper_tts` VITS decoder (latent to PCM) and the `kokoro_tts` iSTFTNet
+generator (latent to spectrogram). Everything below is measured on an
 Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55).
 
 ## Requirements
@@ -125,12 +126,64 @@ reads the implicit zeros past the tensor end. No mask value in the padding fixes
 last ~7 slices of a short latent land 20-40 dB off, the interior windows are exact. paroli ships
 the same trade.
 
+### Kokoro (iSTFTNet) generator
+
+`tools/prepare_kokoro_tts_rknn_generator.py` re-traces the generator the GGUF weights describe
+(`decoder.module.generator.*` in `kokoro-v1_0.pth`) at one fixed window and compiles it. The seam
+is the generator alone — `x [1,512,W]`, the harmonic conditioning `har [1,22,60W+1]`, the style
+vector, and the frame mask at the two rates the graph normalizes at, in and out as
+`spec_phase [1,22,60W+1]`. Source-signal synthesis, the forward STFT and the iSTFT head stay on
+CPU:
+
+```bash
+<export-venv>/bin/python tools/prepare_kokoro_tts_rknn_generator.py \
+  --checkpoint kokoro-v1_0.pth --config config.json --dump-dir <runtime-dump> \
+  --output-dir artifacts --frames 128 --skip-rknn
+<converter-venv>/bin/python tools/prepare_kokoro_tts_rknn_generator.py \
+  --onnx artifacts/generator_w128.onnx --target rk3588
+```
+
+The window is capped by the NPU, not by the model: an op-encoding field on the time axis is 13
+bits, so the longest axis in the graph, the fine rate `60W + 1`, has to stay under 8192. At W=512
+the compiler emits ~800k `REGTASK: The bit width of field value exceeds the limit, ... limit:
+0x1fff, value: 0x7800` lines and the engine voices clipped noise (rms 32764 of 32767, SNR -27 dB
+against the CPU decode). 128 is the widest power of two inside the limit, and it emits
+`128 - 2*28 = 72` latent frames per step, where 28 is the measured receptive field.
+
+Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
+
+- **Weight-norm folded at load.** Left in the graph, `vector_norm` traces to 51 `ReduceL2` nodes
+  and `rknn.build` aborts.
+- **Masked instance norm through `GlobalAveragePool`.** A `ReduceSum` over the time axis lowers to
+  a register field capped at 8191 (the same limit as above); GAP is the pooling engine's own
+  reduction. The mask has to zero the padding at *every* stage boundary — after the upsampling
+  reflect-pad, on the resblock sum, on the noise branch output — not only inside AdaIN's
+  statistics, because a conv after a masked AdaIN writes real-frame sums into the pad and the next
+  `conv_transpose` reads them where a full decode reads implicit zeros. With that, a padded window
+  reproduces the same frames decoded unpadded to 135 dB.
+- **Snake's `sin` to a clipped minimax polynomial, and its `1/alpha` folded into the following
+  convolution.** `librknnrt` has no NPU `Sin`: the 48 sine nodes of a 128-frame window ran on CPU
+  and were 41% of the window's time (350 ms of 846 ms, `RKNN_LOG_LEVEL=5` operator ranking). The
+  polynomial is Clip + 3 Mul + 2 Add at degree 5, and degree 5, 7 and 9 measure the same 30.4 dB
+  against the exact sine, so the clip saturation past pi dominates and the cheap fit wins. The
+  alpha-fold is exact algebra and removes one multiply and one divide per Snake; elementwise ops
+  are 84% of this graph's NPU time and the convolutions 15%, so removing full-tensor passes is
+  where the wall clock is.
+
+The exported graph is checked against the torch graph it was traced from, on the last window of
+the runtime's walk, with the torch reference evaluated in the same sine form (124.6 dB), so the
+gate measures the export and not the approximation.
+
 ## Verified
 
 - Export stage: stepwise-vs-full-decode self-check 111.4 dB at B=64 and 103.7 dB at B=16,
   `cache_numel` 1303424, `head_dim` 64, `kv_len` 71.
 - Conversion stage: converting a reference ONNX reproduces the reference `.rknn` byte for byte
   (identical MD5, 259688011 bytes).
+- Kokoro export stage: the re-traced generator reproduces the runtime's own generator at 60.5 dB
+  interior SNR against a dumped decode, a padded 128-frame window reproduces the same frames
+  decoded unpadded at 135.1 dB, and the exported ONNX reproduces the torch graph it was traced
+  from at 124.6 dB.
 
 
 ## Run
@@ -159,6 +212,19 @@ Piper takes one option and is offline only:
 
 The engine is per voice: a `.rknn` compiled from lessac's latent is validated against the loaded
 voice's channel count at init and fails with a message naming the producer if it does not match.
+
+Kokoro takes one option and is offline only:
+
+```bash
+./build/bin/audiocpp_cli --task tts --family kokoro_tts \
+  --model models/Kokoro-82M-GGUF/kokoro-82m-q8_0.gguf \
+  --text "..." --seed 1234 --out out.wav \
+  --session-option kokoro_tts.rknn_generator=/root/tts-rknn/gen_w128.rknn
+```
+
+The engine is per model, not per voice: the generator weights are in the GGUF, and the engine is
+validated against the loaded model's latent channel count, its spectrogram row count and its audio
+samples per latent frame at init.
 
 ## Measured on RK3588
 
@@ -198,14 +264,49 @@ drift (best lag 0 samples in every window), and the max sample-to-sample step is
 (13384 vs 13412), so no seam clicks. The dips are near-silence (LSB noise) and one loud plosive
 onset, i.e. the fp16 noise floor, not the stitching.
 
+### Kokoro, measured on the same board
+
+`kokoro-82m-q8_0.gguf`, 185 Russian characters, seed 1234, `--threads 4` (14.85 s of audio,
+1188 latent frames, 17 windows of 72 emitted frames):
+
+| path | RTF | peak RSS | generator ms |
+|---|---|---|---|
+| ggml generator | 1.415 | 2777 MB | 17748 |
+| RKNN generator (128-frame window) | 0.867 | 2334 MB | 9609 |
+
+1.63x wall, 1.85x on the generator itself (14.9 → 8.1 ms per latent frame processed), -16% RSS.
+The generator-side gain is smaller than the 5.1x measured in the reference Kokoro engine because
+this window carries 28+28 frames of context for 72 emitted frames (1.78x of compute spent on
+context, and the 28 is the exact receptive field, so it cannot shrink), and because the window
+width is capped at 136 frames by the register-field limit, which is what forces the 17 windows.
+
+Quality: ggml-vs-RKNN output SNR 0.49 dB. That number is *not* a defect measurement and has to be
+read against what it compares. The generator normalizes per window (AdaIN), so a multi-window
+decode is a different valid synthesis and not an approximation of the full-length one: dropping 2
+of 486 latent frames from the statistics moves the generator output by 25% RMS. What is measured
+is exactness per window — a padded window reproduces the same frames decoded unpadded to 135.1 dB
+— and the module reproduces the runtime's own generator to 60.5 dB interior (the floor is the
+q8_0 style affine). The reference Kokoro engine, with the same per-window normalization at
+`T_fix=50`, measures 17.11 dB against its own CPU decode on a 7.1 s utterance (2 windows); the
+gap between its 17 dB and our 0.5 dB is window count, not stitching. Utterances of 72 latent
+frames or fewer (about 0.9 s) fit one window and are exact.
+
 ## NPU core use
 
 `rknn.config` in 2.3.2 has no `core_num` (it has `single_core_mode`), so an engine is built
 multi-core and the runtime core mask decides. `RKNN_NPU_CORE_AUTO` lets the driver pick, and for
 graphs this small it picks one core: `/sys/kernel/debug/rknpu/load` stays at `NPU load: Core0:
-100%` for the whole run. The `piper_tts` sidecar asks for `RKNN_NPU_CORE_0_1_2` explicitly and
-falls back to `AUTO` if the driver rejects it (single-core SoCs do); the `qwen3_tts` sidecar keeps
-`AUTO`, where the vocoder is big enough that the driver spreads it.
+100%` for the whole run. The `piper_tts` and `kokoro_tts` sidecars ask for
+`RKNN_NPU_CORE_0_1_2` explicitly and fall back to `AUTO` if the driver rejects it (single-core
+SoCs do); the `qwen3_tts` sidecar keeps `AUTO`, where the vocoder is big enough that the driver
+spreads it.
+
+One context per sidecar, and one job per context: the mask spreads a *single* job over the cores
+(kokoro measures Core0 95%, Core1 18%, Core2 19% during a run). Running the windows concurrently
+on three `rknn_dup_context` contexts, which is what the reference Kokoro engine does, was built
+and measured here at 1.15x on the window loop (9650 → 8375 ms) with corrupted output (-7 dB SNR,
+rms 2x the reference): duplicated contexts share the runtime's tensor staging, and this engine
+streams ~75 MB of weights per window, so the windows are DRAM-bound, not scheduler-bound.
 
 ## What this path is not for
 
