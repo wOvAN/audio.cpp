@@ -247,13 +247,13 @@
       },
       {
         "name": "rknn_decoder",
-        "type": "string",
+        "type": "path",
         "required": false,
         "description": "Path to a pre-compiled stateful speech-tokenizer decoder .rknn (Rockchip NPU). Requires a build with ENGINE_ENABLE_RKNN. When set, the decoder stage runs on the NPU and its ggml weights are not loaded."
       },
       {
         "name": "rknn_decoder_first",
-        "type": "string",
+        "type": "path",
         "required": false,
         "description": "Optional smaller-batch .rknn used for the first token group only, to cut time-to-first-audio in streaming. Requires rknn_decoder."
       },

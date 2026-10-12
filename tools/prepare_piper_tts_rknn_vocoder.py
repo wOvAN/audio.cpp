@@ -365,7 +365,13 @@ def self_check(onnx_path: Path, window: int, voice_onnx: Path | None = None) -> 
                     f"windowed decode does not match the full decode at {frames} frames "
                     f"({line}); the window contract is wrong"
                 )
-        if global_snr < 20.0:
+        if seams and global_snr < 20.0:
+            # Only when the decode has seams: this gate measures the stitching, and a latent
+            # shorter than the window is one tail window with no seam at all. Its global SNR is
+            # then the documented tail deficit (the last ~7 slices land 20-40 dB off a full-length
+            # decode, which no mask can fix), and on white-noise latents - where the decoder is
+            # driven far outside its input distribution - it lands under the gate on a correct
+            # slice. The per-window report above is what judges a tail window.
             raise SystemExit(
                 f"windowed decode is {global_snr:.1f} dB from the full decode at {frames} frames; "
                 "the stitching is wrong"

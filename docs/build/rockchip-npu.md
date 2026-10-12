@@ -88,8 +88,10 @@ A `.rknn` is compiled per target SoC and is not portable between chips. The grap
 (w16a16) and deliberately not quantized: the Snake activation makes Q8/INT8 audibly noisy
 (9.5-13.4 dB SNR) and fp16 measures lossless (56.8 dB).
 
-`--target` accepts the RKNPU2 platforms the toolkit knows, but only `rk3588` has been built and
-measured here; the others are untested, not unsupported.
+`--target` accepts the RKNPU2 platforms the toolkit knows. Only `rk3588` has been built and
+measured on a board here; `rk3566` conversions of all three families have since been built
+successfully on the host (the engines are unmeasured on a board), the others are untested, not
+unsupported.
 
 ### Piper (VITS) decoder
 
@@ -104,6 +106,11 @@ the slice:
 <converter-venv>/bin/python tools/prepare_piper_tts_rknn_vocoder.py \
   --onnx decoder_z.onnx --target rk3588
 ```
+
+The conversion stage re-runs the self-check on white-noise latents (the voice's own encoder is not
+involved once the slice exists), and its global gate applies only to decodes that contain seams: a
+latent shorter than the window is one tail window with no seam, and its global SNR is the documented
+tail deficit, not a stitching failure.
 
 The seam is the flow input and not the input of `dec.conv_pre`: the flow belongs to the decoder
 half, and the runtime's latent is the pre-flow one. Slicing at `conv_pre` compiles a decoder that
@@ -148,7 +155,11 @@ bits, so the longest axis in the graph, the fine rate `60W + 1`, has to stay und
 the compiler emits ~800k `REGTASK: The bit width of field value exceeds the limit, ... limit:
 0x1fff, value: 0x7800` lines and the engine voices clipped noise (rms 32764 of 32767, SNR -27 dB
 against the CPU decode). 128 is the widest power of two inside the limit, and it emits
-`128 - 2*28 = 72` latent frames per step, where 28 is the measured receptive field.
+`128 - 2*28 = 72` latent frames per step, where 28 is the measured receptive field. The line itself
+is not the failure: the shipped conversions log a few hundred to a few thousand of them (measured
+on the `rk3566` builds: 352 for the Kokoro w128 engine, 355 for the Piper w93 engine, 6570 for the
+Qwen3 B=64 vocoder) and the `rk3588` builds of all three measure clean on the board. What kills the
+engine is the magnitude — `value: 0x7800` is 30720, four times past the field, repeated ~800k times.
 
 Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
 
