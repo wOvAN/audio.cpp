@@ -129,11 +129,11 @@ package.
 
 ## Session Options (use with `--session-option`)
 
-| Option | Description |
-|---|---|
-| `kokoro_tts.weight_type` | Matmul weight storage type: `native`, `f32`, `f16`, `bf16`, `q8_0`. |
-| `kokoro_tts.conv_weight_type` | Convolution weight storage type: `native`, `f32`, `f16`. |
-| `kokoro_tts.rknn_generator` | Pre-compiled RKNN engine for the iSTFTNet generator, voiced on a Rockchip NPU. Needs a build with `ENGINE_ENABLE_RKNN=ON`; see [docs/build/rockchip-npu.md](../build/rockchip-npu.md). |
+| Option | Values | Default | Meaning |
+|---|---|---:|---|
+| `kokoro_tts.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Matmul weight storage type. |
+| `kokoro_tts.conv_weight_type` | `native`, `f32`, `f16` | `native` | Convolution weight storage type. |
+| `kokoro_tts.rknn_generator` | path to a `.rknn` | unset | Pre-compiled RKNN engine for the iSTFTNet generator, voiced on a Rockchip NPU. Needs a build with `ENGINE_ENABLE_RKNN=ON`; see [docs/build/rockchip-npu.md](../build/rockchip-npu.md). |
 
 On RK3588 the generator is 83% of the runtime, so the NPU path is worth the extra file: measured
 RTF 1.415 → 0.867 and peak RSS 2777 → 2334 MB on `kokoro-82m-q8_0` (185 Russian characters,
