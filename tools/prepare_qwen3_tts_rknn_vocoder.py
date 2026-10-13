@@ -407,7 +407,11 @@ def convert_rknn(args, onnx_path, cache_numel, head_dim, kv_len):
         sys.exit(f"ERROR: rknn load_onnx failed: {ret}")
     # FP16 (w16a16), not quantized: the Snake activation makes Q8/INT8 audibly noisy
     # (SNR 9.5-13.4 dB) for 1.75x the speed, while fp16 measures lossless (56.8 dB).
-    ret = rknn.build(do_quantization=False)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from rknn_build_log import rknn_build_gate
+
+    with rknn_build_gate(f"build {os.path.basename(out)}", out + ".build.log"):
+        ret = rknn.build(do_quantization=False)
     if ret != 0:
         sys.exit(f"ERROR: rknn build failed: {ret}")
     ret = rknn.export_rknn(out)

@@ -10,6 +10,14 @@ codes to PCM), the `piper_tts` VITS decoder (latent to PCM) and the `kokoro_tts`
 generator (latent to spectrogram). Everything below is measured on an
 Orange Pi 5 Plus (RK3588, 4x A76 + 4x A55).
 
+**Conditions on the board numbers.** Every RTF, ms and RSS figure here was taken with the vendor
+`rknpu_ondemand` governor, which ramps the NPU to its 1000 MHz OPP: check
+`cat /sys/class/devfreq/fdab0000.npu/cur_freq` (1000000000 under load) and
+`cat /sys/class/devfreq/fdab0000.npu/governor`. The OPP table on that overlay starts at 300 MHz,
+so a board running the mainline `rocket` driver's `performance`-less default can sit at a fraction
+of that clock and every figure here scales with it. The CPU side of the same runs is
+`--threads 4` on the A76 cluster.
+
 ## Requirements
 
 Board side:
@@ -187,19 +195,23 @@ fully-filled window with an all-ones mask still gives 20 534) and not the AdaIN 
 (clamping the count changes the count by 0). A wide window needs that saturation understood first,
 plus a loader that takes 7 inputs and 2 outputs.
 
-**The per-window statistics are the audible artifact, and feeding them is a trade.** Listening
+**The per-window statistics are the audible artifact; feeding them is not the fix.** Listening
 compared the NPU render with the CPU render of the same text and seed found the loudness of
 successive 0.9 s windows swinging -2.8 to +4.5 dB against the CPU render (spread 7.2 dB) with no
 clicks at the seams - the per-window renormalization, heard as compression. `--global-stats` makes
 the statistics graph I/O (`stats_in`/`stats_out`/`use_global`, 7 inputs / 2 outputs) and the runtime
 computes them on CPU from the full latent, one full-length generator pass. In fp32 that is exact:
 the stitched per-window decode against the full-length decode goes from 9.7 dB to 135.4 dB on the
-486-frame dump, with the stitch, the tail and the padding exact once the statistics are global. On
-the board it is not free: the fed statistics scale the window activations up and the engine's fp16
-range cannot carry them at the utterance edges (the first and last windows are taken from the CPU
-pass, 8x the activation scale), and the render measured 1.8x the wall clock (RTF 2.18 against 1.08),
-+1.5 GB RSS, and a *worse* per-window loudness spread (15.9 dB, mean -10.7 dB against the CPU
-render). The capture path needs one runtime detail: `ggml_build_forward_expand` in the vendored ggml
+486-frame dump, with the stitch, the tail and the padding exact once the statistics are global. That
+confirms the diagnosis and rules out this engine as the cure: on the board the fed statistics scale
+the window activations past the engine's fp16 range and every window after the first renders as a
+constant-energy tone. Measured on a 14.85 s utterance: windows 1..15 carry rms flat at 51.5 dB
+(the CPU render swings 57.1 to 67.4), spectral flatness 1.7e-17, and all the energy at DC, 4800 Hz
+and 9600 Hz - Nyquist/2 and 0.8 * Nyquist, i.e. a saturated output, not speech. Only window 0 is
+intelligible, because that one is taken from the CPU pass. The render also costs 1.8x the wall
+clock (RTF 2.18 against 1.08) and +1.5 GB RSS. The path stays opt-in and off by default, as a
+PC-simulator diagnostic for the AdaIN hypothesis; the fix has to be in the window walk, not in the
+statistics. The capture path needs one runtime detail: `ggml_build_forward_expand` in the vendored ggml
 does not set `GGML_TENSOR_FLAG_OUTPUT`, so a captured statistics node with no other consumer is
 freed by the allocator and its buffer is handed to a later node - the statistics nodes must be
 marked as graph outputs. Default off.
@@ -215,25 +227,27 @@ Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
   statistics, because a conv after a masked AdaIN writes real-frame sums into the pad and the next
   `conv_transpose` reads them where a full decode reads implicit zeros. With that, a padded window
   reproduces the same frames decoded unpadded to 135 dB.
-- **Snake's `sin` to a clipped minimax polynomial, and its `1/alpha` folded into the following
-  convolution.** `librknnrt` has no NPU `Sin`: the 48 sine nodes of a 128-frame window ran on CPU
-  and were 41% of the window's time (350 ms of 846 ms, `RKNN_LOG_LEVEL=5` operator ranking). The
-  polynomial is Clip + 3 Mul + 2 Add at degree 5, and degree 5, 7 and 9 measure the same 30.4 dB
-  against the exact sine, so the clip saturation past pi dominates and the cheap fit wins. The
-  alpha-fold is exact algebra and removes one multiply and one divide per Snake; elementwise ops
-  are 84% of this graph's NPU time and the convolutions 15%, so removing full-tensor passes is
-  where the wall clock is.
-- **Opt-in `--sin-reduce`: range-reduce the Snake sine instead of clipping it.** The clip is what
-  sets the 30.4 dB floor: 1.6% of the 49M Snake arguments of a 200-frame decode are past pi
-  (max 20.5), and the clip evaluates the polynomial on a clamped argument, so degrees 5, 7 and 9
-  all plateau at 17.6 dB sine-level SNR. The fold `k = Floor(x/(2*pi) + 0.5); xr = x - k*2*pi`
-  (Mul/Add/Floor/Mul/Sub, all NPU-native) puts the polynomial on `xr` in [-pi, pi], where the fit
-  is valid: 41.7 dB sine-level at degree 5 (70.5 at 7, 103.1 at 9) and 50.0 dB at the generator
-  output against the exact sine (shipping form: 30.4). On the board the engine is not slower than
-  the clipped one (13231 vs 14377 ms for the same 14.85 s utterance in the same session, RTF
-  1.101 vs 1.195); the two NPU outputs differ by 28.2 dB, i.e. the change is audible, and the
-  CPU-vs-NPU SNR of both (0.46/0.48 dB) is the documented per-window AdaIN renormalization, not
-  the sine. The default export path is unchanged and reproduces the shipping ONNX byte for byte.
+- **Snake's `sin` to a range-reduced minimax polynomial, and its `1/alpha` folded into the
+  following convolution.** `librknnrt` has no NPU `Sin`: the 48 sine nodes of a 128-frame window
+  ran on CPU and were 41% of the window's time (350 ms of 846 ms, `RKNN_LOG_LEVEL=5` operator
+  ranking). The polynomial is the fold (below) plus 3 Mul + 2 Add at degree 5, and degree 5, 7 and
+  9 measure the same 50.0 dB against the exact sine once the argument is folded, so the cheap fit
+  wins. The alpha-fold is exact algebra and removes one multiply and one divide per Snake;
+  elementwise ops are 84% of this graph's NPU time and the convolutions 15%, so removing
+  full-tensor passes is where the wall clock is.
+- **`--no-sin-reduce` clips the Snake sine argument at ±pi instead of folding it (the pre-fold
+  export, kept for reproducibility).** The clip is what sets a 30.4 dB floor: 1.6% of the 49M
+  Snake arguments of a 200-frame decode are past pi (max 20.5), and the clip evaluates the
+  polynomial on a clamped argument, so degrees 5, 7 and 9 all plateau at 17.6 dB sine-level SNR.
+  The fold `k = Floor(x/(2*pi) + 0.5); xr = x - k*2*pi` (Mul/Add/Floor/Mul/Sub, all NPU-native)
+  puts the polynomial on `xr` in [-pi, pi], where the fit is valid: 41.7 dB sine-level at degree 5
+  (70.5 at 7, 103.1 at 9) and 50.0 dB at the generator output against the exact sine (clipped
+  form: 30.4). On the board the folded engine is not slower than the clipped one (13231 vs 14377 ms
+  for the same 14.85 s utterance in the same session, RTF 1.101 vs 1.195) and logs 0 REGTASK lines
+  against the clipped build's 352; the two NPU outputs differ by 28.2 dB, i.e. the change is
+  audible, and in a listening test the folded engine ranks between the CPU render and the clipped
+  one. The CPU-vs-NPU SNR of both (0.46/0.48 dB) is the documented per-window AdaIN
+  renormalization, not the sine.
 
 The exported graph is checked against the torch graph it was traced from, on the last window of
 the runtime's walk, with the torch reference evaluated in the same sine form (124.6 dB), so the
@@ -375,6 +389,17 @@ on three `rknn_dup_context` contexts, which is what the reference Kokoro engine 
 and measured here at 1.15x on the window loop (9650 → 8375 ms) with corrupted output (-7 dB SNR,
 rms 2x the reference): duplicated contexts share the runtime's tensor staging, and this engine
 streams ~75 MB of weights per window, so the windows are DRAM-bound, not scheduler-bound.
+
+The core mask is therefore also a numerics knob, and it is why every gate in this document is a
+tolerance gate. The reverse-engineered RK3588 notes record (erratum E7) that the DPU's fp16
+results differ per core on lane 0 of each 16-channel group, so which cores an op is scheduled on
+can change the fp16 value it returns; the mask is not a pure scheduler decision. Consequence for
+this path: "bit-identical" is a claim that holds for the CPU greedy paths (the export gates, the
+gated-cast change on the f16 package), never for an NPU render. Every NPU number here is SNR and
+max|d| against the CPU render, and the observed NPU-to-NPU spread is of the same order as the
+NPU-to-CPU one (the two Kokoro sine engines differ by 28.2 dB from each other). Not characterized
+here: the per-core fp16 difference itself, which would need the same engine run with a
+single-core mask and the outputs compared.
 
 ## What this path is not for
 

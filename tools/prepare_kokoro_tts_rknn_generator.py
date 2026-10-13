@@ -389,7 +389,10 @@ def synth_conditioning(frames: int, scale: int, hop: int, n_fft: int, seed: int)
         pad_mode="constant",
         return_complex=True,
     )
-    return torch.cat([spec.abs(), spec.angle()], dim=1).unsqueeze(0)
+    # The stft of a 1-D source is [bins, frames], so the two halves stack on the channel
+    # axis (dim=0 here, the batch axis is added by the unsqueeze): [2*bins, frames] ->
+    # [1, 2*bins, frames], which is the `har` layout the graph takes.
+    return torch.cat([spec.abs(), spec.angle()], dim=0).unsqueeze(0)
 
 
 def snr(reference: torch.Tensor, windowed: torch.Tensor) -> tuple[float, float]:
@@ -504,7 +507,7 @@ def check_onnx(
     onnx_path: Path,
     sin_degree: int = 7,
     clip: float = 3.14159,
-    sin_reduce: bool = False,
+    sin_reduce: bool = True,
     stats: torch.Tensor | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Run the exported graph on the last window of the runtime's walk and compare it with
@@ -749,7 +752,7 @@ def export_onnx(
     window: int,
     output: Path,
     sin_degree: int = 7,
-    sin_reduce: bool = False,
+    sin_reduce: bool = True,
     global_stats: bool = False,
 ) -> None:
     scale = model.scale
@@ -816,7 +819,12 @@ def convert_rknn(onnx_path: Path, output: Path, target: str) -> None:
     rknn.config(target_platform=target)
     if rknn.load_onnx(model=str(onnx_path), inputs=names, input_size_list=sizes) != 0:
         raise SystemExit("load_onnx failed")
-    if rknn.build(do_quantization=False) != 0:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rknn_build_log import rknn_build_gate
+
+    with rknn_build_gate(f"{output.name}", output.with_suffix(".build.log")):
+        built = rknn.build(do_quantization=False)
+    if built != 0:
         raise SystemExit("build failed (see the rknn log above)")
     if rknn.export_rknn(str(output)) != 0:
         raise SystemExit("export_rknn failed")
@@ -847,17 +855,22 @@ def main() -> int:
         type=int,
         default=5,
         help="odd-polynomial degree for Snake1d's sin in the exported graph (0 keeps Sin, "
-             "which librknnrt runs on CPU). 5 and 9 measure the same 30.4 dB against the "
-             "exact sine: the clip saturation past pi dominates, so take the cheaper fit",
+             "which librknnrt runs on CPU). 5 and 9 measure the same 50.0 dB against the "
+             "exact sine once the argument is range-reduced (the default): the fit is valid "
+             "over the whole folded range, so the extra terms buy nothing. Past the clip "
+             "form (--no-sin-reduce) all degrees plateau at 30.4 dB",
     )
     parser.add_argument(
         "--sin-reduce",
-        action="store_true",
-        help="range-reduce Snake1d's sin (fold to [-pi,pi] with Floor, no Clip) instead of "
-             "clipping it at ±pi. The clip is what sets the 30.4 dB sine floor (measured: "
-             "1.6%% of the Snake arguments of a 200-frame decode are past pi, max 20.5); the "
-             "folded degree-5 fit measures 41.7 dB at the sine and costs 4 extra "
-             "elementwise ops per Snake",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="range-reduce Snake1d's sin (fold to [-pi,pi] with Floor, no Clip); the default. "
+             "Clipping at ±pi is what sets the 30.4 dB sine floor (measured: 1.6%% of the "
+             "Snake arguments of a 200-frame decode are past pi, max 20.5); the folded "
+             "degree-5 fit measures 50.0 dB at the generator output and 41.7 dB at the sine, "
+             "costs 4 extra elementwise ops per Snake, and measured 8%% FASTER on the board "
+             "(RTF 1.101 against 1.195) because it also drops the Clip nodes. "
+             "--no-sin-reduce restores the clipped export byte for byte",
     )
     parser.add_argument(
         "--global-stats",
