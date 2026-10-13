@@ -187,6 +187,23 @@ fully-filled window with an all-ones mask still gives 20 534) and not the AdaIN 
 (clamping the count changes the count by 0). A wide window needs that saturation understood first,
 plus a loader that takes 7 inputs and 2 outputs.
 
+**The per-window statistics are the audible artifact, and feeding them is a trade.** Listening
+compared the NPU render with the CPU render of the same text and seed found the loudness of
+successive 0.9 s windows swinging -2.8 to +4.5 dB against the CPU render (spread 7.2 dB) with no
+clicks at the seams - the per-window renormalization, heard as compression. `--global-stats` makes
+the statistics graph I/O (`stats_in`/`stats_out`/`use_global`, 7 inputs / 2 outputs) and the runtime
+computes them on CPU from the full latent, one full-length generator pass. In fp32 that is exact:
+the stitched per-window decode against the full-length decode goes from 9.7 dB to 135.4 dB on the
+486-frame dump, with the stitch, the tail and the padding exact once the statistics are global. On
+the board it is not free: the fed statistics scale the window activations up and the engine's fp16
+range cannot carry them at the utterance edges (the first and last windows are taken from the CPU
+pass, 8x the activation scale), and the render measured 1.8x the wall clock (RTF 2.18 against 1.08),
++1.5 GB RSS, and a *worse* per-window loudness spread (15.9 dB, mean -10.7 dB against the CPU
+render). The capture path needs one runtime detail: `ggml_build_forward_expand` in the vendored ggml
+does not set `GGML_TENSOR_FLAG_OUTPUT`, so a captured statistics node with no other consumer is
+freed by the allocator and its buffer is handed to a later node - the statistics nodes must be
+marked as graph outputs. Default off.
+
 Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
 
 - **Weight-norm folded at load.** Left in the graph, `vector_norm` traces to 51 `ReduceL2` nodes

@@ -49,6 +49,17 @@ SINE_AMP = 0.1
 NOISE_STD = 0.003
 INPUT_NAMES = ["x", "har", "style", "mask_mid", "mask_out"]
 OUTPUT_NAME = "spec_phase"
+# With --global-stats the graph also takes the AdaIN statistics as inputs and returns the
+# statistics it computed in-graph: `stats_in`/`stats_out` are the per-channel (mean, biased
+# variance) of every AdaIN site, interleaved per site (mean_0, var_0, mean_1, var_1, ...)
+# in forward order, and `use_global` selects the fed statistics. The runtime computes the fed
+# values on CPU from the FULL latent (one full-length CPU generator pass) and feeds them,
+# which makes the windowed decode reproduce the full-length decode exactly: measured on the
+# 486-frame dump, the per-window statistics put the stitched windowed decode 9.7 dB from
+# the full decode (worst window 0.4 dB, seam discontinuity 47% of the column rms), feeding
+# the full-decode statistics puts it at 135.4 dB.
+GLOBAL_STATS_INPUTS = INPUT_NAMES + ["stats_in", "use_global"]
+GLOBAL_STATS_OUTPUTS = [OUTPUT_NAME, "stats_out"]
 
 
 def flatten(prefix: str, value, out: dict | None = None) -> dict:
@@ -111,6 +122,23 @@ class Generator(torch.nn.Module):
         # With a coefficient list, True folds the argument into [-pi, pi] before the
         # polynomial (rewrite_sin_range_reduced) instead of clipping it (the shipped form).
         self.sin_reduce = False
+        # --global-stats: the AdaIN statistics become graph I/O. stats_total is the
+        # concatenated width: every AdaIN site contributes its channel count twice
+        # (mean, variance), in forward order. Per stage: (1 noise_res + one resblock per
+        # kernel) x len(dilations) x 2 (adain1 + adain2) sites, at the stage's channel
+        # count (istftnet.py:262-287).
+        self.global_stats = False
+        self.stats_total = 2 * sum(
+            (1 + len(self.resblock_kernels)) * len(self.resblock_dilations) * 2
+            * int(istftnet["upsample_initial_channel"] // 2 ** (stage + 1))
+            for stage in range(self.stages)
+        )
+        self.stats_in = None
+        self.use_global = None
+        self._stats_pos = 0
+        # Interleaved per site, [mean_0, var_0, mean_1, var_1, ...], matching the
+        # slice layout in adain() (pos advances 2*channels per site).
+        self._stats_parts: list = []
 
     # --- blocks -------------------------------------------------------------
 
@@ -129,6 +157,31 @@ class Generator(torch.nn.Module):
         mean = F.adaptive_avg_pool1d(x * keep, 1) * scale
         centered = x - mean
         variance = F.adaptive_avg_pool1d(centered * centered * keep, 1) * scale
+        if self.global_stats:
+            # Report the in-graph statistics (what the current mask selects) on the
+            # stats_out channel, then normalize with the fed ones where enabled. The
+            # statistics ride as (1, C) slices of the (1, total) stats_in input
+            # (unsqueeze on the way in, squeeze on the way out) — no Reshape
+            # anywhere: the 2.3.2 compiler's fuse_ops pass dies on the exported
+            # graph's Reshapes (`KeyError: '/Reshape_26'` in
+            # graph_optimizer.remove_nodes).
+            channels = int(mean.shape[1])
+            self._stats_parts.append(mean.detach().flatten(2))
+            self._stats_parts.append(variance.detach().flatten(2))
+            fed = self.stats_in[:, self._stats_pos:self._stats_pos + 2 * channels]
+            self._stats_pos += 2 * channels
+            # The in-graph statistics are dead weight in a fed-stats engine, but the
+            # RKNN hardware lowers Where to an arithmetic select, so an fp16 overflow
+            # in the unselected branch (sums over 7681 fine-rate columns exceed the
+            # fp16 range) becomes 0 * inf = nan and poisons the output. Clamp the
+            # branch the engine never selects to the fp16-safe range.
+            mean = mean.clamp(-30000.0, 30000.0)
+            variance = variance.clamp(0.0, 30000.0)
+            selected = self.use_global > 0.5
+            mean = torch.where(selected, fed[:, :channels].unsqueeze(-1), mean)
+            variance = torch.where(selected, fed[:, channels:].unsqueeze(-1), variance)
+            centered = x - mean
+            variance = variance.clamp(min=0.0)
         normalized = centered / torch.sqrt(variance + EPS)
         # Zero the padding on the way out, not just in the statistics: the convolutions
         # downstream read the pad frames, and a padded frame carrying the affine's bias
@@ -226,7 +279,12 @@ class Generator(torch.nn.Module):
 
     # --- graph --------------------------------------------------------------
 
-    def forward(self, x, har, style, mask_mid, mask_out):
+    def forward(self, x, har, style, mask_mid, mask_out, stats_in=None, use_global=None):
+        if self.global_stats:
+            self.stats_in = stats_in.reshape(1, -1)
+            self.use_global = use_global.reshape(1, 1, 1)
+            self._stats_pos = 0
+            self._stats_parts.clear()
         for index in range(self.stages):
             # The mask at the rate this stage works at: W*up0 for stage 0, W*up0*up1 + 1 for
             # stage 1 (the +1 is the reflect pad the last stage prepends).
@@ -263,7 +321,10 @@ class Generator(torch.nn.Module):
                 )
             x = total / len(self.resblock_kernels) * keep
         x = F.leaky_relu(x, 0.01)
-        return F.conv1d(x, self.w["conv_post.weight"], self.w["conv_post.bias"], padding=3)
+        x = F.conv1d(x, self.w["conv_post.weight"], self.w["conv_post.bias"], padding=3)
+        if self.global_stats:
+            return x, torch.cat(self._stats_parts, dim=1)
+        return x
 
 
 def masks_for(keep: torch.Tensor, model: Generator):
@@ -278,8 +339,14 @@ def masks_for(keep: torch.Tensor, model: Generator):
     return mid, torch.cat([fine[:, :, :1], fine], dim=2)
 
 
-def decode(model: Generator, x, har, style, keep):
+def decode(model: Generator, x, har, style, keep, stats=None):
     mid, mask_out = masks_for(keep, model)
+    if stats is not None:
+        return model(x, har, style, mid, mask_out, stats, torch.ones(1, 1, 1))
+    if model.global_stats:
+        # use_global = 0: the in-graph (per-call mask) statistics.
+        return model(x, har, style, mid, mask_out,
+                     torch.zeros(model.stats_total).reshape(1, -1), torch.zeros(1, 1, 1))
     return model(x, har, style, mid, mask_out)
 
 
@@ -353,10 +420,15 @@ def decode_windowed(
     style: torch.Tensor,
     window: int,
     padding: int,
+    stats: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int, float]:
     """The runtime's window walk: `window - 2*padding` latent frames emitted per step, real
     context on each side, zero-padded and mask-zeroed where the latent has run out, and the
     window that reaches the end of the latent extends its left context to fill the shape.
+
+    With `stats` (the full-decode AdaIN statistics, `--global-stats`) every window is
+    normalized with them instead of its own, which is what makes the stitched result equal
+    the full-length decode.
 
     Returns the stitched spectrogram, the window count, and the worst per-window SNR of the
     emitted columns against the same frames decoded unpadded at full length — the check that
@@ -384,17 +456,37 @@ def decode_windowed(
         keep = torch.zeros(1, 1, window)
         keep[:, :, :count] = 1.0
         mid, mask_out = masks_for(keep, model)
-        y = model(xw, hw, style, mid, mask_out)
+        if stats is not None:
+            y = model(xw, hw, style, mid, mask_out, stats, torch.ones(1, 1, 1))[0]
+        elif model.global_stats:
+            y = model(xw, hw, style, mid, mask_out,
+                      torch.zeros(model.stats_total).reshape(1, -1), torch.zeros(1, 1, 1))[0]
+        else:
+            y = model(xw, hw, style, mid, mask_out)
         end = frames if tail else min(frames, start + emitted)
         first = scale * (start - lo)
         last = scale * (end - lo) + 1
-        out[:, :, first:last] = y[:, :, first:last]
+        # Stitch at the global offset, as the runtime does (rknn_generator.cpp:
+        # `out + scale * emitted`). Writing at the window-local offset put every interior
+        # window's output 28 frames early, which made the stitched-vs-full number
+        # meaningless (it read as ~0 dB for the wrong reason).
+        out[:, :, scale * start: scale * end + 1] = y[:, :, first:last]
+        reference_args = (
+            (stats, torch.ones(1, 1, 1))
+            if stats is not None
+            else (torch.zeros(model.stats_total).reshape(1, -1), torch.zeros(1, 1, 1))
+            if model.global_stats
+            else ()
+        )
         reference = model(
             x[:, :, lo:hi],
             har[:, :, scale * lo: scale * lo + columns],
             style,
             *masks_for(torch.ones(1, 1, count), model),
+            *reference_args,
         )
+        if stats is not None or model.global_stats:
+            reference = reference[0]
         worst = min(worst, snr(reference[:, :, first:last], y[:, :, first:last])[0])
         windows += 1
         if tail:
@@ -413,6 +505,7 @@ def check_onnx(
     sin_degree: int = 7,
     clip: float = 3.14159,
     sin_reduce: bool = False,
+    stats: torch.Tensor | None = None,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
     """Run the exported graph on the last window of the runtime's walk and compare it with
     the same window in torch. This is the gate for the export path itself — the tracer, the
@@ -439,19 +532,32 @@ def check_onnx(
     keep = torch.zeros(1, 1, window)
     keep[:, :, :count] = 1.0
     mid, mask_out = masks_for(keep, model)
+    fed = (
+        (stats, torch.ones(1, 1, 1))
+        if stats is not None
+        else (torch.zeros(model.stats_total).reshape(1, -1), torch.zeros(1, 1, 1))
+        if model.global_stats
+        else ()
+    )
     with torch.no_grad():
-        exact = model(xw, hw, style, mid, mask_out)
+        exact = model(xw, hw, style, mid, mask_out, *fed)
+        exact = exact[0] if fed else exact
         model.sin_form = (
             sin_polynomial_coeffs(sin_degree, clip) if sin_degree >= 3 else None
         )
         model.sin_reduce = sin_reduce
-        reference = model(xw, hw, style, mid, mask_out)
+        reference = model(xw, hw, style, mid, mask_out, *fed)
+        reference = reference[0] if fed else reference
         model.sin_form = None
         model.sin_reduce = False
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    tensors = [xw, hw, style, mid, mask_out]
+    if fed:
+        tensors += [fed[0].reshape(1, -1), fed[1].reshape(1, 1, 1)]
     feeds = {
         name: tensor.numpy()
-        for name, tensor in zip(INPUT_NAMES, [xw, hw, style, mid, mask_out])
+        for name, tensor in zip(
+            GLOBAL_STATS_INPUTS if fed else INPUT_NAMES, tensors)
     }
     with torch.no_grad():
         got = torch.from_numpy(session.run(None, feeds)[0])
@@ -639,7 +745,12 @@ def rewrite_sin_range_reduced(model, degree: int = 7, clip: float = 3.14159) -> 
 
 
 def export_onnx(
-    model: Generator, window: int, output: Path, sin_degree: int = 7, sin_reduce: bool = False
+    model: Generator,
+    window: int,
+    output: Path,
+    sin_degree: int = 7,
+    sin_reduce: bool = False,
+    global_stats: bool = False,
 ) -> None:
     scale = model.scale
     args = (
@@ -649,13 +760,15 @@ def export_onnx(
         torch.ones(1, 1, window * model.upsample_rates[0]),
         torch.ones(1, 1, scale * window + 1),
     )
+    if global_stats:
+        args += (torch.zeros(1, model.stats_total), torch.ones(1, 1, 1))
     with torch.no_grad():
         torch.onnx.export(
             model,
             args,
             str(output),
-            input_names=INPUT_NAMES,
-            output_names=[OUTPUT_NAME],
+            input_names=GLOBAL_STATS_INPUTS if global_stats else INPUT_NAMES,
+            output_names=GLOBAL_STATS_OUTPUTS if global_stats else [OUTPUT_NAME],
             opset_version=17,
             do_constant_folding=True,
         )
@@ -746,6 +859,17 @@ def main() -> int:
              "folded degree-5 fit measures 41.7 dB at the sine and costs 4 extra "
              "elementwise ops per Snake",
     )
+    parser.add_argument(
+        "--global-stats",
+        action="store_true",
+        help="make the AdaIN statistics graph I/O (stats_in/stats_out/use_global) instead "
+             "of per-window in-graph values. The runtime computes them on CPU from the FULL "
+             "latent (one full-length CPU generator pass) and feeds them to every window, "
+             "which makes the windowed decode reproduce the full-length decode (measured on "
+             "the 486-frame dump: per-window statistics put the stitched decode 9.7 dB from "
+             "the full decode, fed statistics put it 135.4 dB from it). The default path is "
+             "byte-identical to the shipping export.",
+    )
     parser.add_argument("--skip-rknn", action="store_true", help="export and check only")
     parser.add_argument("--skip-check", action="store_true")
     args = parser.parse_args()
@@ -771,6 +895,7 @@ def main() -> int:
     print(f"receptive field: {padding} latent frames of context per side")
     model = Generator(generator_state, config)
     model.eval()
+    model.global_stats = args.global_stats
     scale = model.scale
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -787,6 +912,9 @@ def main() -> int:
             reference = None
         with torch.no_grad():
             full = decode(model, x, har, style, ones_mask(1, x.shape[-1]))
+            full_stats = None
+            if args.global_stats:
+                full, full_stats = full
         if reference is not None:
             edges = padding * scale
             global_snr, peak = snr(reference, full)
@@ -800,7 +928,8 @@ def main() -> int:
             if window <= 2 * padding:
                 raise SystemExit(f"window {window} leaves no emitted frames at padding {padding}")
             with torch.no_grad():
-                windowed, windows, worst = decode_windowed(model, x, har, style, window, padding)
+                windowed, windows, worst = decode_windowed(
+                    model, x, har, style, window, padding, stats=full_stats)
             global_snr, peak = snr(full, windowed)
             print(f"window {window} (emitted {window - 2 * padding}, {windows} windows): "
                   f"per-window SNR {worst:.1f} dB, vs the full decode {global_snr:.1f} dB "
@@ -808,26 +937,30 @@ def main() -> int:
             if worst < 60.0:
                 raise SystemExit("the windowed decode does not reproduce the same frames decoded "
                                  "unpadded — the padding, masks or stitching are wrong")
-            if windows > 1:
+            if windows > 1 and full_stats is None:
                 # AdaIN normalizes per window, so a multi-window decode is a different (valid)
-                # synthesis, not an approximation of the full-length one: dropping 2 of 486
-                # latent frames from the statistics moves the generator output by 25% RMS
-                # (measured), and the shipping kokoro-server engine (T_fix=50, CTX=2, STEP=46,
+                # synthesis, not an approximation of the full-length one: the stitched decode
+                # lands ~10 dB from the full-length one on the 486-frame dump (worst window
+                # 0.4 dB), and the shipping kokoro-server engine (T_fix=50, CTX=2, STEP=46,
                 # 480-sample crossfade, 11 windows here) measures -0.7 dB against the same
                 # full-length reference. The gate is per-window exactness above; this number is
                 # reported so a regression in the seam is visible, and the audio is judged on
-                # the board.
+                # the board. `--global-stats` closes it in fp32 (fed statistics, 135 dB), and
+                # on the board the engine's fp16 range does not carry the scaled activations:
+                # 1.8x wall clock, +1.5 GB RSS, and a worse per-window loudness spread.
                 print(f"  note: {windows} windows re-estimate the AdaIN statistics per window; "
-                      f"the gap to the full decode is that, not the stitching")
+                      f"the gap to the full decode is that, not the stitching "
+                      f"(--global-stats feeds full-latent statistics instead)")
 
     for window in args.frames:
         onnx_path = args.output_dir / f"{args.prefix}_w{window}.onnx"
-        export_onnx(model, window, onnx_path, args.sin_degree, args.sin_reduce)
+        export_onnx(model, window, onnx_path, args.sin_degree, args.sin_reduce,
+                    global_stats=args.global_stats)
         if not args.skip_check:
             with torch.no_grad():
                 exact, form = check_onnx(
                     model, x, har, style, window, padding, onnx_path,
-                    args.sin_degree, sin_reduce=args.sin_reduce,
+                    args.sin_degree, sin_reduce=args.sin_reduce, stats=full_stats,
                 )
             print(
                 f"  exported graph, last window: {form[0]:.1f} dB against the graph it was "

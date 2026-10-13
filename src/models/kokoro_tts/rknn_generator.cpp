@@ -76,11 +76,14 @@ struct KokoroTtsRknnGenerator::Impl {
     int64_t scale = 0;   // latent frames to spectrogram columns
     int64_t mid_rate = 0;  // latent frames to the stage-0 resblock rate
     uint32_t input_count = 0;
+    bool global_stats = false;
     std::vector<float> x;
     std::vector<float> har;
     std::vector<float> style;
     std::vector<float> mask_mid;
     std::vector<float> mask_out;
+    std::vector<float> stats;  // fed full-decode AdaIN statistics (stats engines)
+    float use_global = 0.0F;
     std::vector<float> spec;
 
     ~Impl() {
@@ -128,15 +131,18 @@ struct KokoroTtsRknnGenerator::Impl {
         if (const int q = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num)); q != 0) {
             throw std::runtime_error(rknn_status("rknn_query(io_num)", q));
         }
-        static const char * kNames[5] = {"x", "har", "style", "mask_mid", "mask_out"};
-        if (io_num.n_input != 5 || io_num.n_output != 1) {
+        static const char * kNames[7] = {
+            "x", "har", "style", "mask_mid", "mask_out", "stats_in", "use_global"};
+        if ((io_num.n_input != 5 || io_num.n_output != 1) &&
+            (io_num.n_input != 7 || io_num.n_output != 2)) {
             throw std::runtime_error(
                 "Kokoro generator RKNN: model " + path + " has " +
                 std::to_string(io_num.n_input) + " inputs / " + std::to_string(io_num.n_output) +
-                " outputs, expected x/har/style/mask_mid/mask_out plus one output; compile it "
-                "with tools/prepare_kokoro_tts_rknn_generator.py");
+                " outputs, expected x/har/style/mask_mid/mask_out (plus stats_in/use_global "
+                "and a stats_out) with one spectrogram output; compile it with "
+                "tools/prepare_kokoro_tts_rknn_generator.py");
         }
-        for (uint32_t index = 0; index < 5; ++index) {
+        for (uint32_t index = 0; index < io_num.n_input; ++index) {
             if (input_name(index) != kNames[index]) {
                 throw std::runtime_error(
                     "Kokoro generator RKNN: model " + path + " input " + std::to_string(index) +
@@ -144,6 +150,7 @@ struct KokoroTtsRknnGenerator::Impl {
             }
         }
         input_count = io_num.n_input;
+        global_stats = io_num.n_input == 7;
 
         rknn_tensor_attr x_attr{};
         x_attr.index = 0;
@@ -210,10 +217,14 @@ struct KokoroTtsRknnGenerator::Impl {
         mask_mid.assign(static_cast<size_t>(mid_rate * window), 0.0F);
         mask_out.assign(static_cast<size_t>(columns), 0.0F);
         spec.assign(static_cast<size_t>(rows * columns), 0.0F);
+        if (global_stats) {
+            stats.assign(static_cast<size_t>(input_elems(5)), 0.0F);
+        }
         debug::timing_log_scalar(
             "kokoro.decoder.rknn.io",
             std::string("window=") + std::to_string(window) + " emitted=" + std::to_string(emitted) +
                 " scale=" + std::to_string(scale) + " mid_rate=" + std::to_string(mid_rate) +
+                " stats=" + std::to_string(global_stats ? stats.size() : 0) +
                 " -> " + std::string(output.name));
     }
 
@@ -254,7 +265,12 @@ struct KokoroTtsRknnGenerator::Impl {
         std::fill_n(mask_out.begin(), static_cast<size_t>(har_cols), 1.0F);
 
         std::vector<rknn_input> inputs(static_cast<size_t>(input_count));
-        const float * buffers[5] = {x.data(), har.data(), style.data(), mask_mid.data(), mask_out.data()};
+        const float * buffers[7] = {
+            x.data(), har.data(), style.data(), mask_mid.data(), mask_out.data(),
+            stats.data(), &use_global};
+        const size_t element_counts[7] = {
+            x.size(), har.size(), style.size(), mask_mid.size(), mask_out.size(),
+            stats.size(), 1};
         for (size_t index = 0; index < inputs.size(); ++index) {
             inputs[index] = {};
             inputs[index].index = static_cast<uint32_t>(index);
@@ -264,13 +280,7 @@ struct KokoroTtsRknnGenerator::Impl {
             inputs[index].type = RKNN_TENSOR_FLOAT32;
             inputs[index].fmt = RKNN_TENSOR_UNDEFINED;
             inputs[index].pass_through = 0;
-            inputs[index].size = static_cast<uint32_t>(
-                (index == 0 ? x.size()
-                 : index == 1 ? har.size()
-                 : index == 2 ? style.size()
-                 : index == 3 ? mask_mid.size()
-                              : mask_out.size()) *
-                sizeof(float));
+            inputs[index].size = static_cast<uint32_t>(element_counts[index] * sizeof(float));
             inputs[index].buf = const_cast<float *>(buffers[index]);
         }
         if (const int r = rknn_inputs_set(ctx, input_count, inputs.data()); r != 0) {
@@ -279,17 +289,23 @@ struct KokoroTtsRknnGenerator::Impl {
         if (const int r = rknn_run(ctx, nullptr); r != 0) {
             throw std::runtime_error(rknn_status("rknn_run", r));
         }
-        rknn_output out{};
-        out.index = 0;
-        out.is_prealloc = 0;
-        out.want_float = 1;
-        if (const int r = rknn_outputs_get(ctx, 1, &out, nullptr); r != 0) {
+        rknn_output out[2] = {};
+        out[0].index = 0;
+        out[0].is_prealloc = 0;
+        out[0].want_float = 1;
+        const uint32_t want = global_stats ? 2 : 1;
+        if (want == 2) {
+            out[1].index = 1;
+            out[1].is_prealloc = 0;
+            out[1].want_float = 1;
+        }
+        if (const int r = rknn_outputs_get(ctx, want, out, nullptr); r != 0) {
             throw std::runtime_error(rknn_status("rknn_outputs_get", r));
         }
-        const auto * data = static_cast<const float *>(out.buf);
-        const size_t got = std::min(spec.size(), static_cast<size_t>(out.size / sizeof(float)));
+        const auto * data = static_cast<const float *>(out[0].buf);
+        const size_t got = std::min(spec.size(), static_cast<size_t>(out[0].size / sizeof(float)));
         std::copy_n(data, got, spec.begin());
-        rknn_outputs_release(ctx, 1, &out);
+        rknn_outputs_release(ctx, want, out);
         if (got != spec.size()) {
             throw std::runtime_error(
                 "Kokoro generator RKNN: window returned " + std::to_string(got) + " values, expected " +
@@ -332,15 +348,41 @@ int64_t KokoroTtsRknnGenerator::columns_per_frame() const {
 #endif
 }
 
+bool KokoroTtsRknnGenerator::uses_global_stats() const {
+#if defined(ENGINE_HAVE_RKNN)
+    return impl_->global_stats;
+#else
+    return false;
+#endif
+}
+
+int64_t KokoroTtsRknnGenerator::stats_elements() const {
+#if defined(ENGINE_HAVE_RKNN)
+    return static_cast<int64_t>(impl_->stats.size());
+#else
+    return 0;
+#endif
+}
+
 std::vector<float> KokoroTtsRknnGenerator::run(
     const float * x,
     int64_t x_stride,
     const float * har,
     int64_t har_stride,
     const float * style,
-    int64_t frames) {
+    int64_t frames,
+    const float * stats) {
 #if defined(ENGINE_HAVE_RKNN)
     auto & impl = *impl_;
+    if (impl.global_stats) {
+        if (stats != nullptr) {
+            std::copy_n(stats, impl.stats.size(), impl.stats.begin());
+            impl.use_global = 1.0F;
+        } else {
+            std::fill(impl.stats.begin(), impl.stats.end(), 0.0F);
+            impl.use_global = 0.0F;  // in-graph per-window statistics (shipping behaviour)
+        }
+    }
     const auto start = Clock::now();
     const int64_t columns = impl.scale * frames + 1;
     std::vector<float> out(static_cast<size_t>(impl.rows * columns), 0.0F);
