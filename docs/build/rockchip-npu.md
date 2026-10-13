@@ -400,16 +400,17 @@ and measured here at 1.15x on the window loop (9650 → 8375 ms) with corrupted 
 rms 2x the reference): duplicated contexts share the runtime's tensor staging, and this engine
 streams ~75 MB of weights per window, so the windows are DRAM-bound, not scheduler-bound.
 
-The core mask is therefore also a numerics knob, and it is why every gate in this document is a
-tolerance gate. The reverse-engineered RK3588 notes record (erratum E7) that the DPU's fp16
-results differ per core on lane 0 of each 16-channel group, so which cores an op is scheduled on
-can change the fp16 value it returns; the mask is not a pure scheduler decision. Consequence for
-this path: "bit-identical" is a claim that holds for the CPU greedy paths (the export gates, the
-gated-cast change on the f16 package), never for an NPU render. Every NPU number here is SNR and
-max|d| against the CPU render, and the observed NPU-to-NPU spread is of the same order as the
-NPU-to-CPU one (the two Kokoro sine engines differ by 28.2 dB from each other). Not characterized
-here: the per-core fp16 difference itself, which would need the same engine run with a
-single-core mask and the outputs compared.
+The core mask is therefore also a numerics knob, and it is why every gate in this document is
+phrased as a tolerance gate: an NPU render is compared by SNR and max|d|, and the observed
+NPU-to-NPU spread is of the same order as the NPU-to-CPU one (the two Kokoro sine engines differ
+by 28.2 dB from each other). Measured on the engine this matters for: the Piper w93 fp16 vocoder,
+8 utterances (one word to a 9-word sentence, three with 28-35 pad slices in the tail window), same
+seed, same binary, `AUDIOCPP_RKNN_CORE_MASK` = core0 / core1 / core2 / all three (the mask is live,
+`/sys/kernel/debug/rknpu/load` shows `Core0: 45%, Core1: 0%, Core2: 0%` for mask 1,
+`Core0: 0%, Core1: 53%, Core2: 0%` for mask 2, Core2 for mask 4) — **all four outputs are
+byte-identical on all eight utterances.** So the per-core fp16 difference the notes record (E7)
+does not show up on this engine, and a bytewise gate is safe for this engine class; it is one
+engine at one width, not a proof about the DPU.
 
 ## What this path is not for
 

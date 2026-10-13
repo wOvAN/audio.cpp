@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -91,7 +92,13 @@ struct PiperTtsRknnDecoder::Impl {
         }
         // AUTO lets the driver pick, and for a graph this small it picks one core
         // (/sys/kernel/debug/rknpu/load stays at 100/0/0). Ask for all three by name.
-        if (const int m = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2); m != 0) {
+        // AUDIOCPP_RKNN_CORE_MASK (1/2/4 = core 0/1/2, 7 = all) pins the mask instead, for
+        // measuring whether an fp16 engine is core-invariant (the DPU notes record a
+        // per-core fp16 difference on lane 0 of each 16-channel group).
+        const int core_mask = std::getenv("AUDIOCPP_RKNN_CORE_MASK") == nullptr
+                                  ? RKNN_NPU_CORE_0_1_2
+                                  : std::atoi(std::getenv("AUDIOCPP_RKNN_CORE_MASK"));
+        if (const int m = rknn_set_core_mask(ctx, static_cast<rknn_core_mask>(core_mask)); m != 0) {
             debug::timing_log_scalar("piper_tts.decoder.rknn.core_mask_ret", m);
             if (const int a = rknn_set_core_mask(ctx, RKNN_NPU_CORE_AUTO); a != 0) {
                 debug::timing_log_scalar("piper_tts.decoder.rknn.core_mask_auto_ret", a);
