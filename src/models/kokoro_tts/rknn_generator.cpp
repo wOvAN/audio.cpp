@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -62,6 +63,9 @@ std::vector<char> read_file(const std::string & path) {
 struct KokoroTtsRknnGenerator::Impl {
     int64_t window = 0;
     int64_t emitted = 0;
+    // Latent frames each window shares with its predecessor (the overlap walk); 0 keeps
+    // the shipping walk, where windows abut and the seams are hard-written.
+    int64_t overlap = 0;
 #if defined(ENGINE_HAVE_RKNN)
     // One context, deliberately. The reference Kokoro engine runs three (one per NPU
     // core, `rknn_dup_context`) to overlap windows; measured here it is 1.15x on the
@@ -321,15 +325,23 @@ KokoroTtsRknnGenerator::KokoroTtsRknnGenerator(
     const std::string & model_path,
     int64_t latent_channels,
     int64_t feature_rows,
-    int64_t samples_per_frame)
+    int64_t samples_per_frame,
+    int64_t overlap)
     : impl_(std::make_unique<Impl>()) {
 #if defined(ENGINE_HAVE_RKNN)
     impl_->load(model_path, latent_channels, feature_rows, samples_per_frame);
+    if (overlap < 0 || overlap >= impl_->emitted) {
+        throw std::runtime_error(
+            "Kokoro generator RKNN: overlap " + std::to_string(overlap) +
+            " must be in [0, " + std::to_string(impl_->emitted) + ") emitted frames");
+    }
+    impl_->overlap = overlap;
 #else
     (void)model_path;
     (void)latent_channels;
     (void)feature_rows;
     (void)samples_per_frame;
+    (void)overlap;
     throw std::runtime_error("Kokoro generator RKNN: built without ENGINE_ENABLE_RKNN");
 #endif
 }
@@ -371,7 +383,8 @@ std::vector<float> KokoroTtsRknnGenerator::run(
     int64_t har_stride,
     const float * style,
     int64_t frames,
-    const float * stats) {
+    const float * stats,
+    const float * reference) {
 #if defined(ENGINE_HAVE_RKNN)
     auto & impl = *impl_;
     if (impl.global_stats) {
@@ -388,7 +401,9 @@ std::vector<float> KokoroTtsRknnGenerator::run(
     std::vector<float> out(static_cast<size_t>(impl.rows * columns), 0.0F);
     int64_t windows = 0;
     const int64_t window_columns = impl.scale * impl.window + 1;
-    for (int64_t emitted = 0; emitted < frames; emitted += impl.emitted) {
+    const int64_t stride = impl.emitted - impl.overlap;
+    const int64_t mag_rows = impl.rows / 2;  // log-magnitude rows, then the phase rows
+    for (int64_t emitted = 0; emitted < frames; emitted += stride) {
         // The window that reaches the end of the latent emits to the end and extends its
         // left context to fill the compiled shape, so the end of the utterance sits at
         // the same tensor boundary it has in a full-length decode.
@@ -400,14 +415,71 @@ std::vector<float> KokoroTtsRknnGenerator::run(
         const int64_t end = tail ? frames : std::min(frames, emitted + impl.emitted);
         const int64_t first = impl.scale * (emitted - lo);
         const int64_t count = impl.scale * (end - emitted) + 1;
-        // Stitched in the spectrogram domain: every window writes its emitted columns
-        // into one full-length spectrogram, which the iSTFT head then runs over once,
-        // so there is no waveform crossfade and no depop search.
+        const int64_t dst = impl.scale * emitted;
+        // Per-window loudness correction against a full-length CPU decode: an additive
+        // offset on the log-magnitude rows that aligns this window's loudness with the
+        // reference's over the same columns. The statistic is the linear-domain
+        // loudness, the per-column sum of exp(log-magnitude) over the magnitude rows
+        // (the waveform's energy proxy; a log-domain mean is dominated by the silence
+        // floor, which is not comparable between the two normalizations). The gain is
+        // the log ratio of the loudness sums over the columns the reference marks as
+        // speech (within 40 dB of the region's loudest column); a region that is pure
+        // silence in the reference gets no gain. The phase rows are untouched.
+        float gain = 0.0F;
+        if (reference != nullptr) {
+            std::vector<float> loud_new(static_cast<size_t>(count), 0.0F);
+            std::vector<float> loud_ref(static_cast<size_t>(count), 0.0F);
+            float loud_max = 0.0F;
+            for (int64_t row = 0; row < mag_rows; ++row) {
+                const float * s = impl.spec.data() + row * window_columns + first;
+                const float * r = reference + row * columns + dst;
+                for (int64_t i = 0; i < count; ++i) {
+                    loud_new[static_cast<size_t>(i)] += std::exp(s[i]);
+                    loud_ref[static_cast<size_t>(i)] += std::exp(r[i]);
+                }
+            }
+            for (int64_t i = 0; i < count; ++i) {
+                loud_max = std::max(loud_max, loud_ref[static_cast<size_t>(i)]);
+            }
+            if (loud_max > 1e-3F) {  // the region carries speech in the reference
+                double sum_new = 0.0;
+                double sum_ref = 0.0;
+                for (int64_t i = 0; i < count; ++i) {
+                    if (loud_ref[static_cast<size_t>(i)] > 0.01F * loud_max) {
+                        sum_new += loud_new[static_cast<size_t>(i)];
+                        sum_ref += loud_ref[static_cast<size_t>(i)];
+                    }
+                }
+                if (sum_new > 0.0 && sum_ref > 0.0) {
+                    gain = static_cast<float>(std::log(sum_ref / sum_new));
+                }
+            }
+        }
+        // Overlap walk: the first `overlap` emitted frames of this window were also
+        // emitted by its predecessor, so blend their spectrogram columns with a
+        // raised-cosine ramp (0 = keep the previous window, 1 = take this one) instead
+        // of overwriting them. With overlap = 0 the region is empty and the stitch is
+        // the shipping hard-write.
+        const int64_t blend =
+            emitted > 0 && impl.overlap > 0
+                ? std::min(impl.scale * impl.overlap, count - 1) + 1
+                : 0;
         for (int64_t row = 0; row < impl.rows; ++row) {
-            std::copy_n(
-                impl.spec.begin() + row * window_columns + first,
-                count,
-                out.begin() + row * columns + impl.scale * emitted);
+            const float * s = impl.spec.data() + row * window_columns + first;
+            float * d = out.data() + row * columns + dst;
+            const float g = row < mag_rows ? gain : 0.0F;
+            for (int64_t i = 0; i < blend; ++i) {
+                const float w = 0.5F - 0.5F * std::cos(
+                    3.14159265358979323846F * static_cast<float>(i) /
+                    static_cast<float>(blend - 1));
+                d[i] = (1.0F - w) * d[i] + w * (s[i] + g);
+            }
+            std::copy_n(s + blend, static_cast<size_t>(count - blend), d + blend);
+            if (g != 0.0F) {
+                for (int64_t i = blend; i < count; ++i) {
+                    d[i] += g;
+                }
+            }
         }
         ++windows;
         if (tail) {
@@ -424,6 +496,8 @@ std::vector<float> KokoroTtsRknnGenerator::run(
     (void)har_stride;
     (void)style;
     (void)frames;
+    (void)stats;
+    (void)reference;
     throw std::runtime_error("Kokoro generator RKNN: built without ENGINE_ENABLE_RKNN");
 #endif
 }

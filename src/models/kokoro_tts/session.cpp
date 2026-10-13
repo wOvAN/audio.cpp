@@ -34,6 +34,8 @@ constexpr const char * kModelName = "Kokoro TTS";
 // generator option is therefore also accepted by name (piper_tts does the same).
 constexpr const char * kPackageIndependentSessionOptions[] = {
     "kokoro_tts.rknn_generator",
+    "kokoro_tts.rknn_generator_overlap",
+    "kokoro_tts.rknn_generator_gain",
 };
 
 }  // namespace
@@ -70,6 +72,28 @@ KokoroTTSSession::KokoroTTSSession(
     if (const auto found = RuntimeSessionBase::options().options.find("kokoro_tts.rknn_generator");
         found != RuntimeSessionBase::options().options.end()) {
         rknn_generator_path_ = found->second;
+    }
+    if (rknn_generator_path_.empty()) {
+        for (const char * option : {"kokoro_tts.rknn_generator_overlap",
+                                    "kokoro_tts.rknn_generator_gain"}) {
+            if (RuntimeSessionBase::options().options.count(option) != 0) {
+                throw std::runtime_error(
+                    std::string(kModelName) + " session option 'kokoro_tts.rknn_generator' " +
+                    "must name an RKNN engine before '" + option + "' can tune its window walk");
+            }
+        }
+    }
+    if (const auto overlap = runtime::parse_i64_option(
+            RuntimeSessionBase::options().options,
+            {"kokoro_tts.rknn_generator_overlap"});
+        overlap.has_value()) {
+        rknn_generator_overlap_ = *overlap;
+    }
+    if (const auto gain = runtime::find_option(
+            RuntimeSessionBase::options().options,
+            {"kokoro_tts.rknn_generator_gain"});
+        gain.has_value()) {
+        rknn_generator_gain_ = runtime::parse_bool_option(*gain, "kokoro_tts.rknn_generator_gain");
     }
     if (task_.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Kokoro TTS only supports tts tasks");
@@ -259,7 +283,9 @@ void KokoroTTSSession::prepare_decoder_graph_capacity(int64_t capacity) {
                 use_device_backend,
                 rng_seed_,
                 decoder_contract,
-                rknn_generator_path_);
+                rknn_generator_path_,
+                rknn_generator_overlap_,
+                rknn_generator_gain_);
         });
     }
     prepared_decoder_capacity_ = capacity;

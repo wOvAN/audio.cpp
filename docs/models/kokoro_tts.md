@@ -134,6 +134,8 @@ package.
 | `kokoro_tts.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Matmul weight storage type. |
 | `kokoro_tts.conv_weight_type` | `native`, `f32`, `f16` | `native` | Convolution weight storage type. |
 | `kokoro_tts.rknn_generator` | path to a `.rknn` | unset | Pre-compiled RKNN engine for the iSTFTNet generator, voiced on a Rockchip NPU. Needs a build with `ENGINE_ENABLE_RKNN=ON`; see [docs/build/rockchip-npu.md](../build/rockchip-npu.md). |
+| `kokoro_tts.rknn_generator_overlap` | latent frames, `0` .. window-1 | `0` | Advance the window walk by `emitted - overlap` frames and blend the shared spectrogram columns with a raised-cosine ramp instead of hard-writing them. Measured on RK3588: 1.54x wall for no change in the per-window loudness spread (7.23 → 7.14 dB), so it is a seam-smoothing knob, not a loudness one. |
+| `kokoro_tts.rknn_generator_gain` | `0` / `1` | `0` | Correct each NPU window's loudness toward a full-length CPU decode of the same latent (additive gain on the log-magnitude rows). Measured on RK3588: per-window loudness spread 7.23 → 3.27 dB for 1.9x wall and +544 MB RSS, because the ggml generator graph stays loaded and runs once per utterance. |
 
 On RK3588 the generator is 83% of the runtime, so the NPU path is worth the extra file: measured
 RTF 1.415 → 0.867 and peak RSS 2777 → 2334 MB on `kokoro-82m-q8_0` (185 Russian characters,

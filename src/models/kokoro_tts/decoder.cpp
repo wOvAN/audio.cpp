@@ -1425,6 +1425,10 @@ struct KokoroIstftNetDecoderRuntime::Impl {
     // Set by the `kokoro_tts.rknn_generator` session option: the generator stage runs on
     // the NPU, so the ggml generator graph is never prepared.
     std::unique_ptr<engine::models::kokoro_tts::KokoroTtsRknnGenerator> rknn_generator;
+    // Set by `kokoro_tts.rknn_generator_gain`: the ggml generator graph stays prepared to
+    // render one full-length CPU decode per utterance, whose loudness corrects each NPU
+    // window (see KokoroTtsRknnGenerator::run's `reference`).
+    bool rknn_generator_gain = false;
 
     Impl(
         std::shared_ptr<const KokoroWeights> weights_in,
@@ -1433,7 +1437,9 @@ struct KokoroIstftNetDecoderRuntime::Impl {
         bool use_device_backend_in,
         uint64_t rng_seed_in,
         KokoroIstftNetDecoderCapacityContract contract_in,
-        const std::string & rknn_generator_path = {})
+        const std::string & rknn_generator_path = {},
+        int64_t rknn_generator_overlap = 0,
+        bool rknn_generator_gain_in = false)
         : weights(std::move(weights_in)),
           n_threads(std::max(1, n_threads_in)),
           use_device_backend(use_device_backend_in),
@@ -1447,7 +1453,8 @@ struct KokoroIstftNetDecoderRuntime::Impl {
               audio::STFTPadMode::Reflect,
               audio::STFTFamily::Kokoro,
           }),
-          generator_graph(weights->decoder.generator, weights->style_dim, backend, n_threads, use_device_backend) {
+          generator_graph(weights->decoder.generator, weights->style_dim, backend, n_threads, use_device_backend),
+          rknn_generator_gain(rknn_generator_gain_in) {
         if (!rknn_generator_path.empty()) {
             const auto & gen = weights->decoder.generator;
             int64_t per_frame = gen.gen_istft_hop_size;
@@ -1458,7 +1465,8 @@ struct KokoroIstftNetDecoderRuntime::Impl {
                 rknn_generator_path,
                 int64_t{512},
                 (gen.gen_istft_n_fft / 2 + 1) * 2,
-                per_frame);
+                per_frame,
+                rknn_generator_overlap);
             // A `--global-stats` engine normalizes its windows with the statistics of a
             // full-length decode, so the ggml generator graph stays alive to produce them.
             generator_graph.set_capture_stats(rknn_generator->uses_global_stats());
@@ -1475,11 +1483,13 @@ struct KokoroIstftNetDecoderRuntime::Impl {
             contract.conditioning_frames,
             n_threads,
             use_device_backend);
-        if (rknn_generator != nullptr && !rknn_generator->uses_global_stats()) {
+        if (rknn_generator != nullptr && !rknn_generator->uses_global_stats() &&
+            !rknn_generator_gain) {
             // The generator stage runs on the NPU; its ggml graph, arena and dequantized
             // weights are all dead weight. A `--global-stats` engine is the exception:
             // its windows are normalized with the statistics of a full-length decode,
-            // so the ggml graph runs once per utterance to produce them.
+            // so the ggml graph runs once per utterance to produce them. The gain knob
+            // is the other: it renders that full-length decode to correct against.
             return;
         }
         generator_graph.prepare(
@@ -1495,7 +1505,9 @@ KokoroIstftNetDecoderRuntime::KokoroIstftNetDecoderRuntime(
     bool use_device_backend,
     uint64_t rng_seed,
     KokoroIstftNetDecoderCapacityContract contract,
-    const std::string & rknn_generator_path)
+    const std::string & rknn_generator_path,
+    int64_t rknn_generator_overlap,
+    bool rknn_generator_gain)
     : impl_(std::make_unique<Impl>(
           std::move(weights),
           backend,
@@ -1503,7 +1515,9 @@ KokoroIstftNetDecoderRuntime::KokoroIstftNetDecoderRuntime(
           use_device_backend,
           rng_seed,
           contract,
-          rknn_generator_path)) {}
+          rknn_generator_path,
+          rknn_generator_overlap,
+          rknn_generator_gain)) {}
 
 KokoroIstftNetDecoderRuntime::~KokoroIstftNetDecoderRuntime() = default;
 
@@ -1558,6 +1572,16 @@ std::vector<float> KokoroIstftNetDecoderRuntime::decode(
                         std::to_string(stats.size()) + " values, the RKNN engine takes " +
                         std::to_string(impl_->rknn_generator->stats_elements()));
                 }
+            } else if (impl_->rknn_generator_gain) {
+                // The gain knob's reference: one full-length CPU decode, whose per-window
+                // loudness the NPU windows are corrected toward.
+                full_out = impl_->generator_graph.run(
+                    predictor.decoder_x,
+                    predictor.decoder_x_rows,
+                    predictor.decoder_x_cols,
+                    predictor.decoder_x_tensor,
+                    *conditioning,
+                    style_decoder);
             }
             generator_output = impl_->rknn_generator->run(
                 decoder_x.data(),
@@ -1566,9 +1590,10 @@ std::vector<float> KokoroIstftNetDecoderRuntime::decode(
                 conditioning->feature_cols,
                 style_decoder.data(),
                 latent_frames,
-                stats.empty() ? nullptr : stats.data());
+                stats.empty() ? nullptr : stats.data(),
+                impl_->rknn_generator_gain ? full_out.data() : nullptr);
             generator_output_cols = latent_frames * columns_per_frame + 1;
-            if (!full_out.empty()) {
+            if (!full_out.empty() && impl_->rknn_generator->uses_global_stats()) {
                 // The fed global statistics make the utterance-edge windows' activations
                 // several times larger than per-window statistics do, and the NPU's fp16
                 // range overflows there (the first and last windows come back inf; the

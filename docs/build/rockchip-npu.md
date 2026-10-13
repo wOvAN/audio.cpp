@@ -226,6 +226,29 @@ does not set `GGML_TENSOR_FLAG_OUTPUT`, so a captured statistics node with no ot
 freed by the allocator and its buffer is handed to a later node - the statistics nodes must be
 marked as graph outputs. Default off.
 
+Two knobs on the walk itself, both off by default (with them unset the render is byte-identical
+to the shipping stitch). `kokoro_tts.rknn_generator_overlap=N` advances the walk by
+`emitted - N` latent frames so adjacent windows share real frames, and blends the shared
+spectrogram columns with a raised-cosine ramp (at N=36 that is 2161 columns, 1.08 s, and 17
+windows become 32). `kokoro_tts.rknn_generator_gain=1` keeps the ggml generator graph prepared,
+renders one full-length CPU decode per utterance, and gives each window's log-magnitude rows an
+additive gain - the log ratio of the linear loudness (per-column sum of `exp(log-magnitude)`,
+speech-masked at 40 dB below the region's loudest column; a plain log-domain mean is dominated by
+the silence floor and measured a 26.3 dB spread) of the reference against the window over the same
+columns. Measured on the same 14.85 s utterance, per-window rms against the CPU render:
+
+| walk | windows | SNR dB | max\|d\| | spread dB | RTF | peak RSS MB |
+|---|---|---|---|---|---|---|
+| stitch (shipping) | 17 | 0.46 | 20777 | 7.23 | 1.16 | 2340 |
+| overlap 36 | 32 | 0.84 | 20715 | 7.14 | 1.79 | 2340 |
+| gain | 17 | -0.08 | 25988 | 3.27 | 2.24 | 2884 |
+| overlap 36 + gain | 32 | 0.38 | 25942 | 3.05 | 3.03 | 2884 |
+| CPU reference | - | - | - | - | 1.37 | 2777 |
+
+So the pumping is a loudness effect, not a seam effect: overlap-blend alone moves the metric not
+at all (7.14) for 1.54x wall, and the loudness correction is what moves it (3.27) for 1.9x wall
+and +544 MB. Neither is the default; `gain=1` is the quality knob when the wall clock is spare.
+
 Three rewrites are compiled in, all of them the reference Kokoro RKNN port's:
 
 - **Weight-norm folded at load.** Left in the graph, `vector_norm` traces to 51 `ReduceL2` nodes

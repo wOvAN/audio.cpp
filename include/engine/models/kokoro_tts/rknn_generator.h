@@ -31,11 +31,23 @@ namespace engine::models::kokoro_tts {
 // every normalization site, interleaved per site in forward order, as an input: the
 // engine then normalizes every window with the statistics of a full-length decode. The
 // caller computes them on CPU from the full latent. In fp32 that is exact (measured:
-// 9.7 dB -> 135.4 dB on the 486-frame dump). On the RK3588 it is a trade, not a win:
-// the statistics scale the window activations up, the engine's fp16 range cannot carry
-// them at the utterance edges (the first and last windows are taken from the CPU pass),
-// and the render costs 1.8x wall clock and +1.5 GB RSS for a per-window loudness spread
-// that measured worse than the shipping engine's (15.9 dB against 7.2 dB). Default off.
+// 9.7 dB -> 135.4 dB on the 486-frame dump). On the RK3588 it is degenerate, not a
+// trade: every window past the first renders as a constant-energy tone (flat rms,
+// spectral flatness 1.7e-17, energy at DC and two fixed frequencies) — the statistics
+// scale the window activations past the engine's fp16 range and the graph collapses.
+// Opt-in, off by default, a PC-simulator diagnostic only.
+//
+// Two knobs soften the per-window-AdaIN pumping of the shipping walk, each off by
+// default (overlap = 0, reference = null keeps the walk byte-identical):
+//  - `overlap` (constructor): advance the walk by `emitted - overlap` latent frames
+//  instead of `emitted`, so adjacent windows share real frames, and blend the shared
+//  spectrogram columns with a raised-cosine ramp instead of hard-writing them.
+//  - `reference` (run): a full-length CPU-decode spectrogram in the same layout as the
+//  result; each window's log-magnitude rows get a per-window additive gain aligning
+//  their loudness (the per-column sum of linear magnitudes, the waveform's energy
+//  proxy) with the reference's over the columns the reference marks as speech (the
+//  silence floor is not comparable between the two normalizations and swamps a plain
+//  log-domain mean).
 class KokoroTtsRknnGenerator {
 public:
     // `latent_channels`, `feature_rows` and `samples_per_frame` (audio samples per latent
@@ -45,7 +57,8 @@ public:
         const std::string & model_path,
         int64_t latent_channels,
         int64_t feature_rows,
-        int64_t samples_per_frame);
+        int64_t samples_per_frame,
+        int64_t overlap = 0);
     ~KokoroTtsRknnGenerator();
 
     KokoroTtsRknnGenerator(const KokoroTtsRknnGenerator &) = delete;
@@ -67,6 +80,8 @@ public:
     // `feature_rows` rows of `frames * columns_per_frame() + 1` contiguous floats.
     // `stats` (only for a `--global-stats` engine) is `stats_elements()` floats of
     // full-decode AdaIN statistics; null falls back to per-window statistics.
+    // `reference` (optional) is a full-length spectrogram in this call's result
+    // layout; each window's log-magnitude rows are gain-corrected toward its loudness.
     std::vector<float> run(
         const float * x,
         int64_t x_stride,
@@ -74,7 +89,8 @@ public:
         int64_t har_stride,
         const float * style,
         int64_t frames,
-        const float * stats = nullptr);
+        const float * stats = nullptr,
+        const float * reference = nullptr);
 
 private:
     struct Impl;
