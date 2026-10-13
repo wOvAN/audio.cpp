@@ -9,12 +9,13 @@ printing
 from the C++ compiler on file descriptors 1 and 2, not through Python logging, so a gate on
 those lines has to redirect the descriptors rather than `sys.stdout`.
 
-The lines are not by themselves a failure. The shipped RK3588 builds log 352 (Kokoro w128
-generator), 355 (Piper w93 vocoder) and 6570 (Qwen3 B=64 vocoder) of them and measure clean on
-the board. What correlates with a dead engine is the magnitude of the count: the Kokoro W=512
-build, whose engine voices clipped noise (measured rms 32764 of 32767, SNR -27 dB against the
-CPU decode), logs 403 587 of them, with the peak value 0x7800 = 30720, nearly four times past
-the 0x1fff field. Hence a threshold between the two regimes, not a zero tolerance.
+The lines are not by themselves a failure. The RK3566 builds of the three shipping engines log 352
+(Kokoro w128 generator), 355 (Piper w93 vocoder) and 6570 (Qwen3 B=64 vocoder) of them and measure
+clean on the board; the RK3588 build of the Piper w93 vocoder logs none. What correlates with a
+dead engine is the magnitude of the count: the Kokoro W=512 build, whose engine voices clipped
+noise (measured rms 32764 of 32767, SNR -27 dB against the CPU decode), logs 403 587 of them, with
+the peak value 0x7800 = 30720, nearly four times past the 0x1fff field. Hence a threshold between
+the two regimes, not a zero tolerance.
 """
 from __future__ import annotations
 

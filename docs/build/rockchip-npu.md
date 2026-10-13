@@ -150,10 +150,17 @@ Conv/ConvTranspose, with the mask upsampled by all-ones `ConvTranspose1d` at eac
 byte for byte, and 4.8 → 45.8 dB for a 47-frame tail window run through `librknnrt` directly. It
 costs +21% window time (RTF 0.0688 → 0.0832 on the 443-character utterance) and changes nothing
 there, because every chunk of that utterance exceeds 69 frames, so no tail window is short: the
-defect is a short-utterance property. A `Resize` node for the mask upsample measures 50-53 dB in
-the PC simulator and -7.9 dB on the board — `Resize` does not lower to a target the board runtime
-accepts, so the upsampler is a `ConvTranspose1d` of all ones (exact nearest, and the same operator
-the decoder already runs on the NPU).
+defect is a short-utterance property. It stays opt-in because the board does not hear it: over 8
+realistic short utterances (one word to a phone-number string, three of them short enough that the
+tail window carries 28-35 pad slices) the two engines score the same against the CPU decode within
+0.1 dB on every one (25.82/25.82, 24.62/24.62, 33.27/33.24 on the padded three), because the fp16
+engine's own noise floor against the CPU decode (22.4-36.2 dB) sits at or below the fp32 tail
+deficit (28.6-43.8 dB) — the defect is buried under the engine's noise, so the +21% buys nothing
+audible. The two engines' outputs do differ by ~60 dB, so the masked engine is live and distinct.
+A `Resize` node for the mask upsample measures 50-53 dB in the PC simulator and -7.9 dB on the
+board — `Resize` does not lower to a target the board runtime accepts, so the upsampler is a
+`ConvTranspose1d` of all ones (exact nearest, and the same operator the decoder already runs on the
+NPU).
 
 ### Kokoro (iSTFTNet) generator
 
@@ -178,10 +185,13 @@ the compiler emits ~800k `REGTASK: The bit width of field value exceeds the limi
 0x1fff, value: 0x7800` lines and the engine voices clipped noise (rms 32764 of 32767, SNR -27 dB
 against the CPU decode). 128 is the widest power of two inside the limit, and it emits
 `128 - 2*28 = 72` latent frames per step, where 28 is the measured receptive field. The line itself
-is not the failure: the shipped conversions log a few hundred to a few thousand of them (measured
-on the `rk3566` builds: 352 for the Kokoro w128 engine, 355 for the Piper w93 engine, 6570 for the
-Qwen3 B=64 vocoder) and the `rk3588` builds of all three measure clean on the board. What kills the
-engine is the magnitude — `value: 0x7800` is 30720, four times past the field, repeated ~800k times.
+is not the failure: the RK3566 builds of the three shipping engines log a few hundred to a few
+thousand of them (measured: 352 for the Kokoro w128 engine, 355 for the Piper w93 engine, 6570 for
+the Qwen3 B=64 vocoder) and measure clean on the board; the RK3588 build of the Piper w93 engine
+logs none. What kills the engine is the magnitude — `value: 0x7800` is 30720, four times past the
+field, repeated ~800k times. `tools/rknn_build_log.py` is the gate that separates the two regimes:
+it captures fds 1/2 around `rknn.build`, because those lines come from the C++ compiler and not from
+Python logging, and aborts past 100 000 lines.
 
 The field is per axis and per op, which is testable: slicing the fine-rate axis inside the graph
 and splitting the inputs and outputs that carry it (so no single op sees more than 8191 columns)

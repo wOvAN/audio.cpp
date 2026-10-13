@@ -459,7 +459,12 @@ def convert_rknn(
     rknn.config(target_platform=target)
     if rknn.load_onnx(model=str(onnx_path), inputs=names, input_size_list=sizes) != 0:
         raise SystemExit("load_onnx failed")
-    if rknn.build(do_quantization=False) != 0:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rknn_build_log import rknn_build_gate
+
+    with rknn_build_gate(f"{output.name}", output.with_suffix(".build.log")):
+        built = rknn.build(do_quantization=False)
+    if built != 0:
         raise SystemExit("build failed (see the rknn log above)")
     if rknn.export_rknn(str(output)) != 0:
         raise SystemExit("export_rknn failed")
