@@ -33,6 +33,7 @@ struct Drama3BackboneDecoderConfig {
     std::string weight_prefix = "model.language_model";
     std::string lm_head_prefix = "lm_head";
     bool tie_word_embeddings = false;
+    std::vector<int32_t> lm_head_token_ids;
     bool round_bf16_activations = false;
     int64_t decode_cache_steps = 2048;
     int64_t cpu_expert_layers = 0;
@@ -71,7 +72,7 @@ public:
     class DecodeSession {
     public:
         virtual ~DecodeSession() = default;
-        virtual void reset() = 0;
+        virtual void reset(bool invalidate_experts = false) = 0;
         virtual Drama3BackboneDecoderForwardResult prefill_embeddings(
             const std::vector<float> & embeddings,
             int64_t steps) = 0;

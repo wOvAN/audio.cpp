@@ -1168,7 +1168,29 @@ private:
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
-        x = modules::LinearModule({config_.hidden_size, config_.vocab_size, false}).build(ctx, x, weights_->lm_head);
+        if (config_.lm_head_token_ids.empty()) {
+            x = modules::LinearModule({config_.hidden_size, config_.vocab_size, false}).build(ctx, x, weights_->lm_head);
+        } else {
+            const auto input = x;
+            auto * head = weights_->lm_head.weight.tensor;
+            // View candidate rows without copying the head weights.
+            for (size_t first = 0; first < config_.lm_head_token_ids.size();) {
+                const auto token = config_.lm_head_token_ids[first];
+                size_t end = first + 1;
+                while (end < config_.lm_head_token_ids.size() &&
+                       config_.lm_head_token_ids[end] == token + static_cast<int64_t>(end - first)) ++end;
+                const auto count = static_cast<int64_t>(end - first);
+                if (token < 0 || token + count > config_.vocab_size)
+                    throw std::runtime_error("Drama 3 LM head candidate range is outside the vocabulary");
+                auto weight = core::wrap_tensor(
+                    ggml_view_2d(ctx.ggml, head, config_.hidden_size, count, head->nb[1], token * head->nb[1]),
+                    core::TensorShape::from_dims({count, config_.hidden_size}), head->type);
+                auto logits = modules::LinearModule({config_.hidden_size, count, false}).build(
+                    ctx, input, {weight, std::nullopt});
+                x = first == 0 ? logits : modules::ConcatModule({2}).build(ctx, x, logits);
+                first = end;
+            }
+        }
         output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
         ggml_set_output(output_);
         mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
@@ -1223,16 +1245,21 @@ public:
         expert_output_ = ggml_new_tensor_2d(persistent, GGML_TYPE_F32, h, k * steps + rows);
         source_rows_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, rows);
         target_rows_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, rows);
+        expert_slot_ids_ = ggml_new_tensor_2d(persistent, GGML_TYPE_I32, 1, rows);
         positions_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, steps);
         mask_ = ggml_new_tensor_4d(persistent, GGML_TYPE_F16, steps, steps, 1, 1);
         for (auto * tensor : {x_, hidden_, residual_, shared_, scales_, ids_, expert_output_, source_rows_,
-                              target_rows_, positions_, mask_})
+                              target_rows_, expert_slot_ids_, positions_, mask_})
             ggml_set_input(tensor);
         buffer_.reset(ggml_backend_alloc_ctx_tensors(persistent, execution.backend()));
         if (!buffer_)
             throw std::runtime_error("cannot allocate Drama 3 offload prefill inputs");
         // Padded expert lanes must never read uninitialized values.
         ggml_backend_buffer_clear(buffer_.get(), 0);
+        std::vector<int32_t> slot_ids(static_cast<size_t>(rows));
+        for (int64_t slot = 0; slot < config.expert_cache_size; ++slot)
+            std::fill_n(slot_ids.begin() + slot * expert_rows, expert_rows, static_cast<int32_t>(slot));
+        ggml_backend_tensor_set(expert_slot_ids_, slot_ids.data(), 0, slot_ids.size() * sizeof(int32_t));
         std::vector<int32_t> positions(static_cast<size_t>(steps));
         std::vector<ggml_fp16_t> mask(static_cast<size_t>(steps * steps));
         for (int64_t row = 0; row < steps; ++row) {
@@ -1317,18 +1344,13 @@ public:
                 graph = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
                 auto * source_rows = ggml_view_1d(ctx.ggml, source_rows_, rows, 0);
                 auto * target_rows = ggml_view_1d(ctx.ggml, target_rows_, rows, 0);
-                auto * input = ggml_reshape_4d(ctx.ggml, ggml_get_rows(ctx.ggml, hidden_, source_rows), h, 1,
-                                               block_rows, config.expert_cache_size);
-                auto * gate_bank = ggml_reshape_4d(ctx.ggml, layer.expert_gate.tensor,
-                    layer.expert_gate.tensor->ne[0], layer.expert_gate.tensor->ne[1], 1, config.expert_cache_size);
-                auto * up_bank = ggml_reshape_4d(ctx.ggml, layer.expert_up.tensor,
-                    layer.expert_up.tensor->ne[0], layer.expert_up.tensor->ne[1], 1, config.expert_cache_size);
-                auto * down_bank = ggml_reshape_4d(ctx.ggml, layer.expert_down.tensor,
-                    layer.expert_down.tensor->ne[0], layer.expert_down.tensor->ne[1], 1, config.expert_cache_size);
-                auto * gate = ggml_mul_mat(ctx.ggml, gate_bank, input);
-                auto * up = ggml_mul_mat(ctx.ggml, up_bank, input);
+                auto * input = ggml_reshape_3d(ctx.ggml, ggml_get_rows(ctx.ggml, hidden_, source_rows), h, 1, rows);
+                // Preserve the resident indexed-MoE arithmetic. Generic batched
+                // GEMMs select different quantized activation paths on CUDA.
+                auto * gate = ggml_mul_mat_id(ctx.ggml, layer.expert_gate.tensor, input, expert_slot_ids_);
+                auto * up = ggml_mul_mat_id(ctx.ggml, layer.expert_up.tensor, input, expert_slot_ids_);
                 auto * activated = ggml_mul(ctx.ggml, ggml_silu(ctx.ggml, gate), up);
-                auto * output = ggml_mul_mat(ctx.ggml, down_bank, activated);
+                auto * output = ggml_mul_mat_id(ctx.ggml, layer.expert_down.tensor, activated, expert_slot_ids_);
                 ggml_build_forward_expand(
                     graph,
                     ggml_set_rows(ctx.ggml, expert_output_, ggml_reshape_2d(ctx.ggml, output, h, rows), target_rows));
@@ -1475,6 +1497,7 @@ private:
     ggml_tensor * expert_output_ = nullptr;
     ggml_tensor * source_rows_ = nullptr;
     ggml_tensor * target_rows_ = nullptr;
+    ggml_tensor * expert_slot_ids_ = nullptr;
     ggml_tensor * positions_ = nullptr;
     ggml_tensor * mask_ = nullptr;
     std::map<ggml_cgraph *, core::HostGraphPlan> plans_;
@@ -1594,8 +1617,9 @@ public:
         prefill_cached_bytes_ = 0;
     }
 
-    void reset() {
+    void reset(bool invalidate_experts = false) {
         valid_steps_ = 0;
+        if (invalidate_experts && weights_->disk_store) weights_->disk_store->invalidate_cache();
         // Masked attention can still multiply a zero probability by a cached
         // value. Initialize KV as well as recurrent state to avoid NaNs from
         // uninitialized storage on the first request.
@@ -1917,8 +1941,8 @@ class Drama3BackboneDecodeSession final : public Drama3BackboneDecoderRuntime::D
 public:
     explicit Drama3BackboneDecodeSession(Drama3BackboneCachedDecodeGraph & graph) : graph_(graph) {}
 
-    void reset() override {
-        graph_.get().reset();
+    void reset(bool invalidate_experts) override {
+        graph_.get().reset(invalidate_experts);
     }
 
     Drama3BackboneDecoderForwardResult prefill_embeddings(
