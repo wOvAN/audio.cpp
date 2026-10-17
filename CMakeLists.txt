@@ -20,6 +20,35 @@ option(AUDIOCPP_DEPLOYMENT_BUILD
 # Model specs remain editable runtime data in normal builds. The converter always
 # carries the source catalog so the conversion binary is portable. Deployment builds
 # additionally compile the catalog into engine_runtime as a fallback for CLI/server.
+#
+# Each spec becomes one C++ string, and MSVC caps a single string literal at 16380
+# single-byte characters (error C2026) before adjacent literals are concatenated --
+# qwen3_tts.json is 16.5 KB on its own. So split each spec into adjacent literals,
+# cutting at newline boundaries so no chunk splits a UTF-8 sequence and every chunk
+# stays plain JSON text.
+function(audiocpp_model_spec_literal out json)
+    set(AUDIOCPP_SPEC_LIMIT 16000)
+    set(AUDIOCPP_SPEC_REST "${json}")
+    set(AUDIOCPP_SPEC_LITERALS "")
+    while(TRUE)
+        string(LENGTH "${AUDIOCPP_SPEC_REST}" AUDIOCPP_SPEC_LEN)
+        if(AUDIOCPP_SPEC_LEN LESS_EQUAL AUDIOCPP_SPEC_LIMIT)
+            string(APPEND AUDIOCPP_SPEC_LITERALS "R\"AUDIOCPP_SPEC(${AUDIOCPP_SPEC_REST})AUDIOCPP_SPEC\"")
+            break()
+        endif()
+        string(SUBSTRING "${AUDIOCPP_SPEC_REST}" 0 ${AUDIOCPP_SPEC_LIMIT} AUDIOCPP_SPEC_HEAD)
+        string(FIND "${AUDIOCPP_SPEC_HEAD}" "\n" AUDIOCPP_SPEC_CUT REVERSE)
+        if(AUDIOCPP_SPEC_CUT LESS 1)
+            # A spec with no newline in the first 16 KB: cut at the limit.
+            set(AUDIOCPP_SPEC_CUT ${AUDIOCPP_SPEC_LIMIT})
+        endif()
+        string(SUBSTRING "${AUDIOCPP_SPEC_REST}" 0 ${AUDIOCPP_SPEC_CUT} AUDIOCPP_SPEC_CHUNK)
+        string(SUBSTRING "${AUDIOCPP_SPEC_REST}" ${AUDIOCPP_SPEC_CUT} -1 AUDIOCPP_SPEC_REST)
+        string(APPEND AUDIOCPP_SPEC_LITERALS "R\"AUDIOCPP_SPEC(${AUDIOCPP_SPEC_CHUNK})AUDIOCPP_SPEC\" ")
+    endwhile()
+    set(${out} "${AUDIOCPP_SPEC_LITERALS}" PARENT_SCOPE)
+endfunction()
+
 file(GLOB AUDIOCPP_MODEL_SPEC_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/model_specs/*.json")
 set(AUDIOCPP_BUILTIN_MODEL_SPEC_ENTRIES "")
 set(AUDIOCPP_CONVERTER_MODEL_SPEC_ENTRIES "")
@@ -27,13 +56,14 @@ set(AUDIOCPP_NATIVE_PACKAGE_SPEC_ENTRIES "")
 foreach(AUDIOCPP_MODEL_SPEC_FILE IN LISTS AUDIOCPP_MODEL_SPEC_FILES)
     get_filename_component(AUDIOCPP_MODEL_SPEC_FAMILY "${AUDIOCPP_MODEL_SPEC_FILE}" NAME_WE)
     file(READ "${AUDIOCPP_MODEL_SPEC_FILE}" AUDIOCPP_MODEL_SPEC_JSON)
+    audiocpp_model_spec_literal(AUDIOCPP_MODEL_SPEC_LITERAL "${AUDIOCPP_MODEL_SPEC_JSON}")
     string(APPEND AUDIOCPP_CONVERTER_MODEL_SPEC_ENTRIES
-        "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", R\"AUDIOCPP_SPEC(${AUDIOCPP_MODEL_SPEC_JSON})AUDIOCPP_SPEC\"},\n")
+        "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", ${AUDIOCPP_MODEL_SPEC_LITERAL}},\n")
     string(APPEND AUDIOCPP_NATIVE_PACKAGE_SPEC_ENTRIES
-        "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", R\"AUDIOCPP_SPEC(${AUDIOCPP_MODEL_SPEC_JSON})AUDIOCPP_SPEC\"},\n")
+        "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", ${AUDIOCPP_MODEL_SPEC_LITERAL}},\n")
     if (AUDIOCPP_DEPLOYMENT_BUILD)
         string(APPEND AUDIOCPP_BUILTIN_MODEL_SPEC_ENTRIES
-            "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", R\"AUDIOCPP_SPEC(${AUDIOCPP_MODEL_SPEC_JSON})AUDIOCPP_SPEC\"},\n")
+            "    {\"${AUDIOCPP_MODEL_SPEC_FAMILY}\", ${AUDIOCPP_MODEL_SPEC_LITERAL}},\n")
     endif()
 endforeach()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -3271,8 +3301,23 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
     if (auk IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(auk_conditioning_test tests/auk/conditioning_test.cpp)
+        target_sources(auk_conditioning_test PRIVATE
+            src/community_models/auk/audio_conditioning.cpp
+            src/community_models/auk/conditioning.cpp)
         add_engine_unittest(auk_vae_test tests/auk/vae_test.cpp)
+        target_sources(auk_vae_test PRIVATE src/community_models/auk/vae.cpp)
         add_engine_unittest(auk_flow_test tests/auk/flow_test.cpp)
+        # The flow test drives the session end to end, so it needs every runtime the
+        # session builds, not just the flow stage.
+        target_sources(auk_flow_test PRIVATE
+            src/community_models/auk/audio_conditioning.cpp
+            src/community_models/auk/conditioning.cpp
+            src/community_models/auk/flow.cpp
+            src/community_models/auk/session.cpp
+            src/community_models/auk/vae.cpp)
+        # session.cpp includes <yaml.h>, whose include dir yaml_vendor exports PUBLIC
+        # and engine_runtime does not re-export.
+        target_link_libraries(auk_flow_test PRIVATE yaml_vendor)
     endif()
 
     if (ENGINE_ENABLE_CUDA)
@@ -3295,10 +3340,14 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
     if (sortformer_diar_v2 IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(sortformer_v2_aosc_test
             tests/community_models/sortformer_diar/sortformer_v2_aosc_test.cpp)
+        target_sources(sortformer_v2_aosc_test PRIVATE src/community_models/sortformer_diar/aosc_state.cpp)
         add_test(NAME sortformer_v2_aosc_test COMMAND sortformer_v2_aosc_test)
 
         add_engine_unittest(sortformer_v2_schedule_test
             tests/community_models/sortformer_diar/sortformer_v2_schedule_test.cpp)
+        target_sources(sortformer_v2_schedule_test PRIVATE
+            src/community_models/sortformer_diar/frontend.cpp
+            src/community_models/sortformer_diar/stream_schedule.cpp)
         add_test(NAME sortformer_v2_schedule_test COMMAND sortformer_v2_schedule_test)
     endif()
 
@@ -3334,15 +3383,21 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_test(NAME audio8_tts_falcon_kv_cache_test COMMAND audio8_tts_falcon_kv_cache_test)
     endif()
 
-    if (parakeet_tdt IN_LIST AUDIOCPP_LINKED_MODELS)
-        add_engine_unittest(phonon_hotwords_test tests/parakeet_tdt/test_hotwords.cpp)
-        add_test(NAME phonon_hotwords_test COMMAND phonon_hotwords_test)
-        add_engine_unittest(phonon_features_probe tests/parakeet_tdt/phonon_features_probe.cpp)
-        add_engine_unittest(parakeet_variant_config_test tests/parakeet_tdt/test_variant_config.cpp)
-        target_include_directories(parakeet_variant_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
-        target_compile_definitions(parakeet_variant_config_test PRIVATE ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
-        add_test(NAME parakeet_variant_config_test COMMAND parakeet_variant_config_test)
+    add_engine_unittest(phonon_hotwords_test tests/parakeet_tdt/test_hotwords.cpp)
+    target_sources(phonon_hotwords_test PRIVATE src/community_models/parakeet_tdt/hotwords.cpp)
+    target_include_directories(phonon_hotwords_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external/llama_tokenizer)
+    add_test(NAME phonon_hotwords_test COMMAND phonon_hotwords_test)
 
+    add_engine_unittest(parakeet_variant_config_test tests/parakeet_tdt/test_variant_config.cpp)
+    target_sources(parakeet_variant_config_test PRIVATE src/community_models/parakeet_tdt/assets.cpp)
+    target_include_directories(parakeet_variant_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
+    target_compile_definitions(parakeet_variant_config_test PRIVATE ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME parakeet_variant_config_test COMMAND parakeet_variant_config_test)
+
+    # The probe drives the registry/session path end to end, so it needs the
+    # full parakeet_tdt model library.
+    if (parakeet_tdt IN_LIST AUDIOCPP_LINKED_MODELS)
+        add_engine_unittest(phonon_features_probe tests/parakeet_tdt/phonon_features_probe.cpp)
     endif()
 
     if (granite5asr IN_LIST AUDIOCPP_LINKED_MODELS)
@@ -3549,6 +3604,10 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         # supertonic tokenizer, so in a subset set it links a model symbol.
         if (supertonic IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(unicode_normalization_test tests/unittests/test_unicode_normalization.cpp)
+        # The test exercises the framework normalizer through the supertonic
+        # tokenizer, so it needs that one family source to link in a subset set.
+        target_sources(unicode_normalization_test PRIVATE
+            src/models/supertonic/tokenizer_text.cpp)
         add_test(NAME unicode_normalization_test COMMAND unicode_normalization_test)
         endif()
 
@@ -4242,6 +4301,9 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (echo_tts IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(echo_tts_host_units tests/echo_tts/echo_tts_host_units.cpp)
+        target_sources(echo_tts_host_units PRIVATE
+            src/community_models/echo_tts/latent_post.cpp
+            src/community_models/echo_tts/tokenizer.cpp)
         add_test(
             NAME echo_tts_host_units
             COMMAND echo_tts_host_units
@@ -4250,6 +4312,10 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (sanotts IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(sanotts_frontend_test tests/unittests/test_sanotts_frontend.cpp)
+        target_sources(sanotts_frontend_test PRIVATE
+            src/community_models/sanotts/frontend.cpp
+            src/community_models/sanotts/neon_decoder.cpp
+            src/community_models/sanotts/runtime.cpp)
         target_include_directories(sanotts_frontend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(
             NAME sanotts_frontend_test
@@ -4260,6 +4326,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         # cpu_decoder=neon against a double-precision reference on random weights (no model files)
         if (sanotts IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(sanotts_neon_decoder_test tests/unittests/test_sanotts_neon_decoder.cpp)
+        target_sources(sanotts_neon_decoder_test PRIVATE src/community_models/sanotts/neon_decoder.cpp)
         target_include_directories(sanotts_neon_decoder_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests
             ${CMAKE_CURRENT_SOURCE_DIR}/src/community_models/sanotts)
@@ -4280,6 +4347,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (voxtral_realtime IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(voxtral_realtime_stream_chunking_test tests/unittests/test_voxtral_realtime_stream_chunking.cpp)
+        target_sources(voxtral_realtime_stream_chunking_test PRIVATE src/models/voxtral_realtime/frontend.cpp)
         target_include_directories(voxtral_realtime_stream_chunking_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(
             NAME voxtral_realtime_stream_chunking_test
@@ -4298,6 +4366,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (outetts IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(outetts_generation_budget_test tests/unittests/test_outetts_generation_budget.cpp)
+        target_sources(outetts_generation_budget_test PRIVATE src/community_models/outetts/tokenizer.cpp)
         target_include_directories(outetts_generation_budget_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(
             NAME outetts_generation_budget_test
@@ -4324,6 +4393,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (minimax_music3 IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(minimax_music3_lm_head_test tests/unittests/test_minimax_music3_lm_head.cpp)
+        target_sources(minimax_music3_lm_head_test PRIVATE src/community_models/minimax_music3/global_lm.cpp)
         target_include_directories(minimax_music3_lm_head_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(
             NAME minimax_music3_lm_head_test
@@ -4354,6 +4424,9 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (qwen3_forced_aligner IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(qwen3_forced_aligner_processor_test tests/unittests/test_qwen3_forced_aligner_processor.cpp)
+        target_sources(qwen3_forced_aligner_processor_test PRIVATE
+            src/models/qwen3_asr/tokenizer_text.cpp
+            src/models/qwen3_forced_aligner/processor.cpp)
         target_include_directories(qwen3_forced_aligner_processor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(
             NAME qwen3_forced_aligner_processor_test
@@ -4405,6 +4478,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         if (mms_forced_aligner IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(mms_forced_aligner_session_test tests/unittests/test_mms_forced_aligner_session.cpp)
         target_sources(mms_forced_aligner_session_test PRIVATE
+            src/community_models/mms_forced_aligner/assets.cpp
             src/community_models/mms_forced_aligner/ctc_alignment.cpp
             src/community_models/mms_forced_aligner/emissions.cpp
             src/community_models/mms_forced_aligner/session.cpp
@@ -4642,6 +4716,7 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
 
         if (hviske_asr IN_LIST AUDIOCPP_LINKED_MODELS)
         add_engine_unittest(asr_standalone_gguf_test tests/unittests/test_asr_standalone_gguf.cpp)
+        target_sources(asr_standalone_gguf_test PRIVATE src/models/hviske_asr/assets.cpp)
         target_include_directories(asr_standalone_gguf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         target_compile_definitions(asr_standalone_gguf_test PRIVATE
             ENGINE_TEST_ASSET_ROOT="${ENGINE_UNITTEST_ASSET_ROOT}"
