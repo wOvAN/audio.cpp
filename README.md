@@ -111,6 +111,7 @@ Model weights keep the license of their original release, which is separate from
 | **neutts** | TTS, Ctrl | en | NeuTTS 2E with built-in speaker prompts and emotion control | GGUF original precision, Stream |
 | **omnivoice** | TTS, Clone, Design, Ctrl | 646+ langs | OmniVoice, Qwen3-0.6B based<br>VoiceTut-TTS (Egyptian Arabic fine-tune) | GGUF 16/Q8, Stream |
 | **personaplex** | Dialogue, S2S | en | PersonaPlex 7B v1 speech-to-speech conversational model with packaged voice/persona prompts | GGUF Q4/Q8, Stream |
+| **plapre** | TTS, Clone, Ctrl, Edit | da | Plapre 3, five preset voices | GGUF F32/BF16, Stream |
 | **pocket_tts** | TTS, Clone | en, fr, de, it, pt, es | PocketTTS-100M English/French/German/Italian/Portuguese/Spanish | GGUF 16/Q8, Stream |
 | **qwen3_tts** | TTS, Clone, Design, Ctrl | zh, en, fr, de, it, ja, ko, pt, ru, es | Qwen3-TTS-12Hz-0.6B-Base<br>Qwen3-TTS-12Hz-1.7B-Base<br>Qwen3-TTS-12Hz-1.7B-CustomVoice<br>Qwen3-TTS-12Hz-1.7B-VoiceDesign | GGUF 16/Q8, Stream |
 | **supertonic** | TTS | en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na | Supertonic 3 | GGUF F32, Stream |
@@ -137,6 +138,7 @@ Model weights keep the license of their original release, which is separate from
 | **index_echo** | ASR, Translate | zh → en, es, ja | Index-Echo-S2TT 2B<br>Index-Echo-S2TT 9B | GGUF original/Q8_0/Q4_K |
 | **marblenet_vad** | VAD | lang agnostic | MarbleNet VAD | Bundled |
 | **micro_wake_word** | Wake | model dependent | microWakeWord MixedNet TFLite models converted to GGUF | GGUF F32, Stream |
+| **open_wake_word** | Wake | en | OpenWakeWord Alexa | GGUF F32, Stream |
 | **firered_vad** | VAD | lang agnostic | FireRed VAD / Stream-VAD | GGUF F32/F16/Q8, Stream |
 | **pulsevad** | VAD | lang agnostic | PulseVAD 2.1K Student / 81K Teacher | GGUF F32 |
 | **moonshine_asr** | ASR | en | Moonshine Streaming Tiny/Small/Medium | GGUF Q8, Stream |
@@ -236,7 +238,7 @@ Community model ports live under `community_models` to make the ownership bounda
 | **sortformer_diar_v2** | Diar | multilingual | GGUF F32/mixed F16, Stream | [@LysanderdeJong](https://github.com/LysanderdeJong) | [NVIDIA Sortformer v2.1](docs/models/sortformer_diar_v2.md) four-speaker streaming diarization; local conversion only pending redistribution approval |
 | **vieneu_v3_turbo** | TTS, Clone | vi, en | GGUF | Bảo [@pnnbao97](https://github.com/pnnbao97) (model author); first port by Phuoc [@phuocnguyen90](https://github.com/phuocnguyen90) | [VieNeu-TTS v3 Turbo](docs/models/vieneu_v3_turbo.md) 48 kHz Vietnamese/English TTS and voice cloning (formerly `vietneu_tts`) |
 | **vibeasr** | ASR | en | GGUF I8_S + I2_S | [@XsquirrelC](https://github.com/XsquirrelC) / VibeASR | [VibeASR](docs/models/vibeasr.md) fully quantized port of [VibeASR.cpp](https://github.com/microsoft/VibeASR.cpp): VibeVoice acoustic/semantic tokenizers on INT8 weights and INT8 activations, feeding a ternary BitNet Qwen2 decoder. Offline, CPU only |
-| **whistle_asr** | ASR | en, de, fr, es, it, nl, pl | GGUF F32, Safetensors F32 | [@bumpyclock](https://github.com/bumpyclock) | [Whistle ASR](docs/models/whistle_asr.md) experimental offline transcription with a GGML encoder on CPU or Metal; 16 kHz mono, at most 30 seconds; local conversion only |
+| **whistle_asr** | ASR | en, de, fr, es, it, nl, pl | GGUF F32, Safetensors F32 | [@bumpyclock](https://github.com/bumpyclock) | [Whistle ASR](docs/models/whistle_asr.md) experimental offline transcription with a GGML encoder on CPU, Metal, CUDA, or Vulkan and a host decoder; 16 kHz mono, at most 30 seconds |
 | **voxcpm1** | TTS, Clone | zh, en, ja, ko | GGUF Q8, Stream | [@jasonchen31](https://github.com/jasonchen31) | [VoxCPM1](docs/models/voxcpm1.md) tokenizer-free 0.5B TTS with 16 kHz output, streaming, and continuation-mode voice cloning |
 
 

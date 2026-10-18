@@ -223,6 +223,35 @@ Always set `family`, `task`, and `mode` explicitly rather than relying on inferr
 names or defaults. Several entries can use the same family with different GGUFs,
 tasks, or modes, provided each entry has a unique `id`.
 
+For instruction-conditioned models, per-model `"instruct": "..."` is a shortcut
+for `"default_request_options": {"instruct": "..."}`. Use one form or the other;
+setting the shortcut together with `instruct` or `instruction` in
+`default_request_options` is rejected as ambiguous.
+
+### Default session options
+
+Top-level `"default_session_options"` sets session options for every model of a
+family, keyed `<family>.<option>`. A model gets the entries of its family that its
+own `session_options` do not set. This applies to the configured models and to
+models loaded later through `POST /v1/models/load`, which is how the WebUI loads
+a model with `--ui-management`. The WebUI sends the catalog's session options,
+not the config's, so without defaults such a load drops settings like memory
+options:
+
+```json
+{
+  "ui_management": true,
+  "default_session_options": {
+    "irodori_tts.mem_saver": true,
+    "irodori_tts.codec_decode_chunk_steps": 100
+  },
+  "models": []
+}
+```
+
+A key without a family prefix is rejected when the config loads. A value for a
+family that never loads is ignored.
+
 ### Paths and model specs
 
 Relative model and configured voice-library paths resolve against the config
@@ -267,10 +296,19 @@ endpoint, or `request.options` on generic task endpoints.
 | `--task tts --mode offline` | `models[].task` and `models[].mode` | Choose the matching entry; a request does not change its session mode. |
 | `--load-option key=value` | `models[].load_options` | Not an inference-request option. |
 | `--session-option family.key=value` | `models[].session_options` | Not an inference-request option. |
+| `--session-option family.key=value` for every model of that family | top-level [`default_session_options`](#default-session-options) | Not an inference-request option. |
 | `--request-option key=value` | `models[].default_request_options` | Speech `options`, or generic `request.options`. |
 | `--seed 1234`, `--max-tokens 512` | `default_request_options`: `seed`, `max_tokens` | Speech also accepts these as top-level fields. |
 | `--instruct "..."` | `default_request_options`: use the model's documented option, usually `instruct` | `options.instruct` for a model accepting `instruct`; see the speech endpoint for the distinct `instructions` field. |
 | `--voice-ref` and `--reference-text` | `default_voice_preset` / `voice_presets` | Speech `voice_ref` and `reference_text`; see [voices](#voices). |
+
+For instruction-conditioned speech requests, the normalized top-level `instruct`
+field maps to the model option `instruct`, matching CLI `--instruct`. The existing
+`instructions` field remains supported and maps to `instruction` for backward
+compatibility. Each top-level field overrides its corresponding option under
+`options`. An explicit request instruction overrides either configured spelling,
+preserving the request spelling for model compatibility. Do not send both
+top-level spellings in one request; the server rejects that ambiguity.
 
 Keep family prefixes on session/load option names where the model's docs require
 them. The server does not automatically prefix arbitrary keys or translate every
@@ -494,6 +532,28 @@ configured preset. If the name is not a preset, the server checks the shared
 reference library before passing it through as a model-native voice ID.
 For built-in speakers, configure `voice_id` using an ID valid for that model,
 such as `af_heart` for Kokoro; preset names and native voice IDs are not universal.
+
+A preset can also carry request `options` for the model. Explicit request options
+override preset options with the same key. Different aliases are not merged;
+supplying conflicting aliases may produce a model validation error. The model
+validates preset options like any other request option. For example, an
+Irodori-TTS speaker embedding selected by name:
+
+```json
+{
+  "voice_presets": {
+    "narrator": {
+      "options": {
+        "speaker_embedding_file": "/absolute/path/to/narrator.speaker.safetensors"
+      }
+    }
+  }
+}
+```
+
+A request `{"input": "Hello.", "voice": "narrator"}` then uses that embedding.
+Option values are not paths to the server, so a relative path is not resolved
+against the config file the way `voice_ref` is; use absolute paths.
 
 ### Voice library (`voice_dir`)
 

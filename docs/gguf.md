@@ -126,11 +126,13 @@ Status labels:
 | `nemotron_asr` | Done | Pass | --- | Pass | Pass (minor filler drift) |
 | `neutts` | Done | Pass | --- | Pass | --- |
 | `omnivoice` | Done | Pass | --- | Pass (drift) | Pass (drift) |
+| `open_wake_word` | Done | --- | Pass (F32) | --- | --- |
 | `outetts` | Done | Pass (TTS + clone) | --- | --- | Pass (TTS + clone) |
 | `owsm` | Done | --- | Pass | --- | Pass (drift) |
 | `parakeet_tdt` | Done | Pass | Pass | Pass | Pass |
 | `personaplex` | Done | --- | --- | --- | Pass |
 | `piper_tts` | Done | Pass | Pass | --- | --- |
+| `plapre` | Done | --- | Pass (F32; TTS + clone) | Pass (BF16; TTS + clone) | --- |
 | `pocket_tts` | Done | Pass | --- | Pass | Pass (drift) |
 | `pulsevad` | Done | Pass | Pass | --- | --- |
 | `qwen3_asr` | Done | Pass | --- | Pass | Pass |
@@ -163,7 +165,7 @@ Status labels:
 | `voxcpm2` | Done | Pass | Pass | Pass (ASR match, drift) | Pass (ASR match, drift) |
 | `voxtral_realtime` | Done | Pass | --- | Pass | Pass |
 | `voxtral_tts` | Done | --- | --- | Pass (BF16) | Pass |
-| `whistle_asr` | Done | --- | --- | --- | --- |
+| `whistle_asr` | Done | --- | Pass (F32) | --- | --- |
 
 Additional lower-bit checks:
 
