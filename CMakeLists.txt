@@ -498,7 +498,8 @@ add_library(engine_core OBJECT
     src/framework/model_spec/schema.cpp
     src/framework/assets/tensor_source.cpp
     src/framework/assets/weight_norm_folding.cpp
-    src/framework/assets/lora_tensor_source.cpp
+    src/framework/assets/weight_adapter.cpp
+    src/framework/assets/weight_adapter_source.cpp
     src/framework/assets/torch_bin.cpp
     src/framework/core/module.cpp
     src/framework/core/backend.cpp
@@ -3444,6 +3445,14 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
     endif()
 
     if (ENGINE_ENABLE_CUDA)
+        add_engine_unittest(torch_random_cuda_multi_device_test
+            tests/unittests/test_torch_random_cuda_multi_device.cu)
+        target_include_directories(torch_random_cuda_multi_device_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(torch_random_cuda_multi_device_test PRIVATE CUDA::cudart)
+        add_test(NAME torch_random_cuda_multi_device_test COMMAND torch_random_cuda_multi_device_test)
+        set_tests_properties(torch_random_cuda_multi_device_test PROPERTIES SKIP_RETURN_CODE 77)
+
         add_engine_unittest(cuda_bias_fusion_test tests/unittests/test_cuda_bias_fusion.cpp)
         add_test(NAME cuda_bias_fusion_test COMMAND cuda_bias_fusion_test)
         set_tests_properties(cuda_bias_fusion_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -3812,8 +3821,10 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_engine_unittest(gguf_tensor_source_test tests/unittests/test_gguf_tensor_source.cpp)
         target_include_directories(gguf_tensor_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(NAME gguf_tensor_source_test COMMAND gguf_tensor_source_test)
-        add_engine_unittest(lora_tensor_source_test tests/unittests/test_lora_tensor_source.cpp)
-        add_test(NAME lora_tensor_source_test COMMAND lora_tensor_source_test --log)
+        add_engine_unittest(weight_adapter_source_test tests/unittests/test_weight_adapter_source.cpp)
+        add_test(NAME weight_adapter_source_test COMMAND weight_adapter_source_test --log)
+        add_engine_unittest(weight_adapter_test tests/unittests/test_weight_adapter.cpp)
+        add_test(NAME weight_adapter_test COMMAND weight_adapter_test --log)
 
         add_engine_unittest(transformer_kv_ring_test tests/unittests/test_transformer_kv_ring.cpp)
         add_test(NAME transformer_kv_ring_test COMMAND transformer_kv_ring_test)
