@@ -140,9 +140,12 @@ option(ENGINE_HIP_STRIX_HALO_OPTIMIZATIONS
 # librknnrt. The engine links the board runtime; the models themselves are
 # converted offline on x86 with rknn-toolkit2.
 option(ENGINE_ENABLE_RKNN "Build the Rockchip NPU (librknnrt) decoder path" OFF)
+option(ENGINE_ENABLE_RKNN_OPEN "Build the open rknpu2_matmul (AGPL) OmniVoice generator path - private board builds only" OFF)
 option(ENGINE_ENABLE_NEON "Build opt-in NEON library and native model paths" OFF)
 set(ENGINE_RKNN_INCLUDE_DIR "" CACHE PATH "Directory containing rknn_api.h (empty = use the system include path)")
 set(ENGINE_RKNN_LIBRARY "rknnrt" CACHE STRING "librknnrt to link (path or library name)")
+set(ENGINE_RKNN_OPEN_INCLUDE_DIR "" CACHE PATH "Directory containing rk_npu_matmul_f16.h (open rknpu2_matmul library)")
+set(ENGINE_RKNN_OPEN_LIBRARY "rk_npu_matmul" CACHE STRING "librk_npu_matmul to link (path or library name)")
 option(ENGINE_ENABLE_NATIVE_CPU "Build ggml CPU kernels with native host ISA flags" ${ENGINE_DEFAULT_ENABLE_NATIVE_CPU})
 option(ENGINE_ENABLE_OPENMP "Build host code with OpenMP support" ON)
 option(AUDIOCPP_STATIC_ESPEAK "Build and statically link GPL-3.0-or-later eSpeak-ng; keep data separate" OFF)
@@ -465,6 +468,15 @@ function(audiocpp_configure_runtime_object target_name)
         target_compile_definitions(${target_name} PRIVATE ENGINE_HAVE_RKNN=1)
         if (ENGINE_RKNN_INCLUDE_DIR)
             target_include_directories(${target_name} PRIVATE ${ENGINE_RKNN_INCLUDE_DIR})
+        endif()
+    endif()
+    if (ENGINE_ENABLE_RKNN_OPEN)
+        target_compile_definitions(${target_name} PRIVATE ENGINE_HAVE_RKNN_OPEN=1)
+        # ovs_engine.cpp uses ARMv8.2-A fp16 NEON intrinsics (__fp16, vcvt_f32_f16,
+        # vld1_f16); the board's default -march lacks the +fp16 extension.
+        target_compile_options(${target_name} PRIVATE -march=armv8.2-a+fp16)
+        if (ENGINE_RKNN_OPEN_INCLUDE_DIR)
+            target_include_directories(${target_name} PRIVATE ${ENGINE_RKNN_OPEN_INCLUDE_DIR})
         endif()
     endif()
     target_link_libraries(${target_name} PRIVATE ggml sentencepiece)
@@ -972,6 +984,8 @@ audiocpp_add_model(omnivoice
         src/models/omnivoice/prompt_builder.cpp
         src/models/omnivoice/generator.cpp
         src/models/omnivoice/rknn_generator.cpp
+        src/models/omnivoice/rknn_open_generator.cpp
+        src/models/omnivoice/rknn_open/ovs_engine.cpp
         src/models/omnivoice/postprocess.cpp
         src/models/omnivoice/session.cpp
         src/models/omnivoice/loader.cpp
@@ -3123,6 +3137,13 @@ if (ENGINE_ENABLE_RKNN)
         target_include_directories(engine_runtime PUBLIC ${ENGINE_RKNN_INCLUDE_DIR})
     endif()
     target_link_libraries(engine_runtime PUBLIC ${ENGINE_RKNN_LIBRARY})
+endif()
+if (ENGINE_ENABLE_RKNN_OPEN)
+    target_compile_definitions(engine_runtime PRIVATE ENGINE_HAVE_RKNN_OPEN=1)
+    if (ENGINE_RKNN_OPEN_INCLUDE_DIR)
+        target_include_directories(engine_runtime PUBLIC ${ENGINE_RKNN_OPEN_INCLUDE_DIR})
+    endif()
+    target_link_libraries(engine_runtime PUBLIC ${ENGINE_RKNN_OPEN_LIBRARY})
 endif()
 if (ENGINE_ENABLE_HIP)
     # ggml-hip publicly defines GGML_USE_CUDA for consumers, so engine code

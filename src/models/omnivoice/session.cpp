@@ -240,7 +240,19 @@ void append_cross_faded_chunk(
 // bucket, registered up front because an engine takes seconds to init and the step loop needs
 // it ~32 times per utterance. The ladder travels as the exec_plan component's main artifact,
 // comma-separated, because the roles of an exec_plan artifact block are a closed vocabulary
-// while the ladder is not.
+// while the ladder is not. The `rknn_open` impl (private board builds) needs no artifacts: it
+// runs the same trunk on the open multicore matmul library straight off the host weight store.
+bool generator_rknn_open_from_options(const runtime::SessionOptions & options) {
+    const auto exec_plan = runtime::parse_exec_plan(
+        options.options,
+        "omnivoice.exec_plan",
+        {{"generator", "ggml",
+          {{"ggml", {options.backend.type}, {}, {}, {}},
+           {"rknn", {}, {"main"}, {}, {}},
+           {"rknn_open", {}, {}, {}, {}}}}});
+    return exec_plan.at("generator").impl == "rknn_open";
+}
+
 std::vector<std::string> generator_rknn_engines_from_options(
     const runtime::SessionOptions & options,
     const OmniVoiceAssets & assets) {
@@ -249,7 +261,8 @@ std::vector<std::string> generator_rknn_engines_from_options(
         "omnivoice.exec_plan",
         {{"generator", "ggml",
           {{"ggml", {options.backend.type}, {}, {}, {}},
-           {"rknn", {}, {"main"}, {}, {}}}}});
+           {"rknn", {}, {"main"}, {}, {}},
+           {"rknn_open", {}, {}, {}, {}}}}});
     const auto & generator_plan = exec_plan.at("generator");
     if (generator_plan.impl != "rknn") {
         return {};
@@ -309,6 +322,7 @@ OmniVoiceSession::OmniVoiceSession(
           audio_tokenizer_codebook_weight_storage_type_),
       prompt_builder_(assets_, tokenizer_),
       generator_rknn_engines_(generator_rknn_engines_from_options(options, *assets_)),
+      generator_rknn_open_(generator_rknn_open_from_options(options)),
       generator_(
           assets_,
           execution_context(),
@@ -321,7 +335,8 @@ OmniVoiceSession::OmniVoiceSession(
           generator_packed_cfg_,
           generator_device_scoring_,
           generator_packed_projections_,
-          generator_rknn_engines_) {
+          generator_rknn_engines_,
+          generator_rknn_open_) {
     engine::debug::trace_log_scalar("omnivoice.perf_mode", perf_mode_name(generator_perf_mode_));
     if (task_.task != runtime::VoiceTaskKind::Tts &&
         task_.task != runtime::VoiceTaskKind::VoiceCloning &&

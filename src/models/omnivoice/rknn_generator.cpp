@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -329,6 +330,24 @@ struct OmniVoiceRknnGenerator::Impl {
             }
             guidance = in.guidance;
 
+            if (const char * d = std::getenv("AUDIOCPP_RKNN_DUMP_FEEDS")) {  // feed dump for A/B
+                static int n = 0;
+                if (front_shard && n++ == 0) {
+                    static const char * names[5] = {"/f.ids.bin", "/f.amask.bin", "/f.attn.bin", "/f.cos.bin", "/f.sin.bin"};
+                    const void * ptrs[5] = {ids.data(), audio_mask.data(), attn_mask.data(), rope_cos.data(), rope_sin.data()};
+                    const size_t esz[5] = {sizeof(int64_t), sizeof(float), sizeof(float), sizeof(float), sizeof(float)};
+                    const size_t nel[5] = {ids.size(), audio_mask.size(), attn_mask.size(), rope_cos.size(), rope_sin.size()};
+                    for (int i = 0; i < 5; ++i) {
+                        char path[512];
+                        std::snprintf(path, sizeof path, "%s%s", d, names[i]);
+                        if (FILE * fh = std::fopen(path, "wb")) {
+                            std::fwrite(ptrs[i], esz[i], nel[i], fh);
+                            std::fclose(fh);
+                        }
+                    }
+                }
+            }
+
             std::vector<engine::rknn::Input> inputs(front_shard ? kFrontInputCount : kInputCount);
             inputs[kInputIds].buf = ids.data();
             inputs[kInputAudioMask].buf = audio_mask.data();
@@ -370,6 +389,15 @@ struct OmniVoiceRknnGenerator::Impl {
                     out + static_cast<size_t>(row_capacity) * h,
                     last_output.data() + static_cast<size_t>(tokens) * h,
                     static_cast<size_t>(target) * h * sizeof(float));
+                if (const char * d = std::getenv("AUDIOCPP_RKNN_DUMP_HIDDEN")) {  // twin-dump for A/B
+                    static int n = 0;
+                    char path[512];
+                    std::snprintf(path, sizeof path, "%s/cmp.%03d.bin", d, n++);
+                    if (FILE * fh = std::fopen(path, "wb")) {
+                        std::fwrite(last_output.data(), sizeof(float), last_output.size(), fh);
+                        std::fclose(fh);
+                    }
+                }
                 return;
             }
             if (output_row_major_codebook) {
@@ -472,7 +500,10 @@ struct OmniVoiceRknnGenerator::Impl {
             return a->tokens < b->tokens;
         });
         if (slots.empty()) {
-            throw std::runtime_error(std::string(kLabel) + ": no engine paths given");
+            // The open-library generator (rknn_open_generator.h) derives from this class and
+            // registers no compiled ladders; an empty ladder is inert here (bucket_for 0,
+            // run throws) so the derived vtable drives the request.
+            return;
         }
         // The board states its own ceiling; 0 means pin every rung the deployment declares.
         const int64_t budget_mib = aperture_budget_mib();
@@ -542,6 +573,11 @@ OmniVoiceRknnGenerator::OmniVoiceRknnGenerator(
 }
 
 OmniVoiceRknnGenerator::~OmniVoiceRknnGenerator() = default;
+
+// The compiled ladder recomputes the whole canvas every step and keeps no
+// per-request state, so the hook is a no-op here; the open-library generator
+// overrides it to drop its KV caches.
+void OmniVoiceRknnGenerator::reset() {}
 
 int64_t OmniVoiceRknnGenerator::max_tokens() const {
     return impl_->slots.empty() ? 0 : impl_->slots.back()->tokens;
