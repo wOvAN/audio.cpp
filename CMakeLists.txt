@@ -472,9 +472,6 @@ function(audiocpp_configure_runtime_object target_name)
     endif()
     if (ENGINE_ENABLE_RKNN_OPEN)
         target_compile_definitions(${target_name} PRIVATE ENGINE_HAVE_RKNN_OPEN=1)
-        # ovs_engine.cpp uses ARMv8.2-A fp16 NEON intrinsics (__fp16, vcvt_f32_f16,
-        # vld1_f16); the board's default -march lacks the +fp16 extension.
-        target_compile_options(${target_name} PRIVATE -march=armv8.2-a+fp16)
         if (ENGINE_RKNN_OPEN_INCLUDE_DIR)
             target_include_directories(${target_name} PRIVATE ${ENGINE_RKNN_OPEN_INCLUDE_DIR})
         endif()
@@ -976,6 +973,19 @@ if(AUDIOCPP_STATIC_ESPEAK)
     target_compile_definitions(engine_model_kokoro_tts PRIVATE AUDIOCPP_STATIC_ESPEAK=1)
 endif()
 
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    # ovs_engine.cpp / ovz_engine.cpp use ARMv8.2-A fp16 NEON intrinsics
+    # (__fp16, vcvt_f32_f16, vld1_f16); the board's default -march lacks the
+    # +fp16 extension. Scoped to these two sources: RK3562/RK3561-class boards
+    # have no FP16 SIMD at all, so the flag must not leak into unrelated
+    # model sources (it would risk SIGILL there).
+    set_source_files_properties(
+        src/models/omnivoice/rknn_open/ovs_engine.cpp
+        src/models/omnivoice/rknn_zeroop/ovz_engine.cpp
+        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16"
+    )
+endif()
+
 audiocpp_add_model(omnivoice
     SOURCES
         src/models/omnivoice/assets.cpp
@@ -986,6 +996,8 @@ audiocpp_add_model(omnivoice
         src/models/omnivoice/rknn_generator.cpp
         src/models/omnivoice/rknn_open_generator.cpp
         src/models/omnivoice/rknn_open/ovs_engine.cpp
+        src/models/omnivoice/rknn_zeroop_generator.cpp
+        src/models/omnivoice/rknn_zeroop/ovz_engine.cpp
         src/models/omnivoice/postprocess.cpp
         src/models/omnivoice/session.cpp
         src/models/omnivoice/loader.cpp

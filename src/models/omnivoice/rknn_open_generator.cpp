@@ -117,7 +117,10 @@ struct OmniVoiceRknnOpenGenerator::Impl {
         // additive mask: cond rows attend to [0, seq); the uncond batch is seen
         // at its canvas rows [seq-tgt, seq) (prefill; content lives in the target
         // block) and at block-local rows [0, tgt) (step), each visible only to the
-        // matching column block
+        // matching column block. The compiled-engine convention, NOT the HF canvas
+        // mask (whose target rows are self-only): an HF-mask experiment on this
+        // sampler rendered non-speech at every rung (2026-11-15), the dLLM step
+        // mask is only valid together with HF's own unmasking schedule.
         mask_bias.assign(static_cast<size_t>(2) * seq * seq, kMaskValue);
         for (int64_t r = 0; r < seq; ++r) {
             std::fill(mask_bias.data() + static_cast<size_t>(r * seq),
@@ -201,6 +204,7 @@ OmniVoiceRknnOpenGenerator::OmniVoiceRknnOpenGenerator(
     // conversion volume so the vector never reallocates
     size_t arena_need = 0;
     for (const auto & w : weights.layers) {
+        if (!w.packed) { arena_need += (qkv_rows + gu_rows) * H; }  // fused [q|k|v] / [gate|up] blocks
         if (!w.packed && !w.qkv_is_f16) { arena_need += (dims.heads + 2 * dims.kv_heads) * HD * H; }
         if (!w.packed && !w.gu_is_f16) { arena_need += gu_rows * H; }
         if (!w.o_is_f16) { arena_need += H * qkvo_rows; }

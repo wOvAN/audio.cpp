@@ -16,6 +16,7 @@
 #include "engine/framework/modules/weight_binding.h"
 #include "engine/models/omnivoice/rknn_generator.h"
 #include "engine/models/omnivoice/rknn_open_generator.h"
+#include "engine/models/omnivoice/rknn_zeroop_generator.h"
 
 #include <ggml-backend.h>
 #include <ggml.h>
@@ -1911,7 +1912,8 @@ OmniVoiceQwen3DiffusionRuntime::OmniVoiceQwen3DiffusionRuntime(
     bool device_scoring,
     bool packed_projections,
     std::vector<std::string> rknn_engine_paths,
-    bool rknn_open)
+    bool rknn_open,
+    bool rknn_zeroop)
     : impl_(std::make_unique<Impl>()) {
     if (assets == nullptr) {
         throw std::runtime_error("OmniVoice generator requires assets");
@@ -1940,8 +1942,7 @@ OmniVoiceQwen3DiffusionRuntime::OmniVoiceQwen3DiffusionRuntime(
             impl_->assets->config.llm.rope_theta,
             impl_->assets->config.llm.hidden_size);
     }
-    if (rknn_open) {
-#if defined(ENGINE_HAVE_RKNN_OPEN)
+    if (rknn_open || rknn_zeroop) {
         const auto & w = impl_->runtime->weights();
         const auto & cfg = impl_->assets->config;
         OmniVoiceOpenWeightViews views;
@@ -1988,17 +1989,36 @@ OmniVoiceQwen3DiffusionRuntime::OmniVoiceQwen3DiffusionRuntime(
         dims.hidden = cfg.llm.hidden_size;
         dims.intermediate = cfg.llm.intermediate_size;
         dims.rope_theta = cfg.llm.rope_theta;
-        std::string open_cache;
-        if (const char * env = std::getenv("AUDIOCPP_RKNN_OPEN_CACHE"); env != nullptr) {
-            open_cache = env;
+        std::string sidecar_cache;
+        const char * cache_env = std::getenv(rknn_zeroop ? "AUDIOCPP_RKNN_ZEROOP_CACHE"
+                                                        : "AUDIOCPP_RKNN_OPEN_CACHE");
+        if (cache_env != nullptr) {
+            sidecar_cache = cache_env;
         } else {
-            open_cache = (impl_->assets->resources.model_directory() / "rknn-open-cache").string();
+            sidecar_cache = (impl_->assets->resources.model_directory() /
+                             (rknn_zeroop ? "rknn-zeroop-cache" : "rknn-open-cache"))
+                                .string();
         }
-        impl_->rknn = std::make_unique<OmniVoiceRknnOpenGenerator>(
-            views, dims, open_cache, "omnivoice-open-v1");
-#else
-        throw std::runtime_error("omnivoice.exec_plan generator impl rknn_open: built without ENGINE_ENABLE_RKNN_OPEN");
+        const std::string sidecar_fingerprint = rknn_zeroop ? "omnivoice-zeroop-v1"
+                                                           : "omnivoice-open-v1";
+#if defined(ENGINE_HAVE_RKNN_OPEN)
+        if (rknn_open) {
+            impl_->rknn = std::make_unique<OmniVoiceRknnOpenGenerator>(
+                views, dims, sidecar_cache, sidecar_fingerprint);
+        }
 #endif
+#if defined(ENGINE_HAVE_RKNN)
+        if (rknn_zeroop) {
+            impl_->rknn = std::make_unique<OmniVoiceRknnZeroopGenerator>(
+                views, dims, sidecar_cache, sidecar_fingerprint);
+        }
+#endif
+        if (impl_->rknn == nullptr) {
+            throw std::runtime_error(
+                std::string("omnivoice.exec_plan generator impl ") +
+                (rknn_zeroop ? "rknn_zeroop: built without ENGINE_ENABLE_RKNN"
+                             : "rknn_open: built without ENGINE_ENABLE_RKNN_OPEN"));
+        }
     }
 }
 

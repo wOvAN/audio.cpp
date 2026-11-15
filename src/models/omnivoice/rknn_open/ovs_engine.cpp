@@ -5,6 +5,7 @@
 // layer-0 hidden states; its SNR gate measured layer 0 only, so the engine must
 // not inherit that shortcut).
 #include "ovs_engine.h"
+#if defined(__aarch64__)
 
 #include <algorithm>
 #include <arm_neon.h>
@@ -506,6 +507,19 @@ int Engine::step(const float* h_tgt, const float* cos2, const float* sin2,
     for (int b = 0; b < 2; ++b)
         for (int s = 0; s < tp; ++s)  // rows [tgt,tp) are pad (zero) -> canvas pad rows re-zeroed
             memcpy(&hc[(size_t)(b * sp + seq - tgt + s) * kHid], &h_tgt[(size_t)(b * tp + s) * kHid], kHid * 4);
+    // dLLM canvas masks are self-only for every step query row (the target block is
+    // unmasked one token per step, so each row attends to exactly itself). Then the
+    // fused attention run is an identity on V: ctx[row] = V_scaled[row]. Detect it
+    // once per call; any non-self-only mask (causal, block) keeps the NPU path.
+    int selfonly = 1;
+    for (int b = 0; b < 2 && selfonly; ++b) {
+        const int rb0 = b == 0 ? prefix : 0;
+        for (int s = 0; s < tp && selfonly; ++s) {
+            const uint8_t* mrow = &I.maskb[((size_t)b * sp + rb0 + s) * sp];
+            const uint8_t* v0 = (const uint8_t*)memchr(mrow, 1, (size_t)sp);
+            if (!v0 || v0 != mrow + rb0 + s || (v0 + 1 < mrow + sp && memchr(v0 + 1, 1, (size_t)(sp - (rb0 + s) - 1)))) selfonly = 0;
+        }
+    }
     for (int l = 0; l < kLayers; ++l) {
         for (int b = 0; b < 2; ++b)
             for (int s = 0; s < tp; ++s)
@@ -565,8 +579,21 @@ int Engine::step(const float* h_tgt, const float* cos2, const float* sin2,
         if (t) t->kv += now_us() - kv0;
         // cond step rows read their canvas mask rows; uncond rows are block-local
         // (maskb b1 rows [0,tgt) = visible [0,tgt) = the appended target block)
-        if (I.attn_rows(l, 0, seq - tgt, tp, sp, (long)sp * kHD, t) ||
-            I.attn_rows(l, 1, 0, tp, sp, (long)sp * kHD, t)) return 1;
+        if (selfonly) {
+            double a0 = now_us();
+            for (int b = 0; b < 2; ++b) {
+                const float inv = 1.0f / p_now[b];
+                const int rb0 = b == 0 ? prefix : 0;
+                for (int hh = 0; hh < kNH; ++hh)
+                    for (int s = 0; s < tp; ++s) {
+                        const uint16_t* sv = &I.v16[((size_t)b * kNKV + hh / 2) * (long)sp * kHD + (size_t)(rb0 + s) * kHD];
+                        uint16_t* dc = &I.ctxh[(((size_t)b * tp + s) * kNH + hh) * kHD];
+                        for (int c = 0; c < kHD; ++c) dc[c] = f2h(h2f(sv[c]) * inv);
+                    }
+            }
+            if (t) t->attn += now_us() - a0;
+        } else if (I.attn_rows(l, 0, seq - tgt, tp, sp, (long)sp * kHD, t) ||
+                   I.attn_rows(l, 1, 0, tp, sp, (long)sp * kHD, t)) return 1;
         if (I.gemm(l, 1, m2, I.ctxh.data(), I.o32.data(), t)) return 1;
         for (int b = 0; b < 2; ++b)
             for (int s = 0; s < tp; ++s) {
@@ -607,5 +634,36 @@ int Engine::caches_truncate(int len) {
 }
 
 }  // namespace ovs
+
+#else  // !__aarch64__: the engine is ARMv8.2-A fp16 NEON and links the
+       // aarch64-only rknpu2_matmul library. ENGINE_ENABLE_RKNN_OPEN is
+       // arch-neutral, so non-aarch64 builds compile this stub; open() fails
+       // and the generator surfaces last_error().
+namespace ovs {
+
+Engine::Engine() : im_(nullptr) {}
+Engine::~Engine() {}
+int Engine::open(const char*, const char*, const std::string&) { return -1; }
+void Engine::close() {}
+void Engine::set_weights(const std::vector<LayerW>&) {}
+int Engine::pack_weights() { return -1; }
+int Engine::ensure_geometry(int, int) { return -1; }
+int Engine::prefill(const float*, const float*, const float*, const float*, int, int, int, float*, Timings*) { return -1; }
+int Engine::step(const float*, const float*, const float*, const float*, int, int, int, float*, Timings*) { return -1; }
+int Engine::caches_truncate(int) { return 0; }
+const std::string& Engine::last_error() const {
+    static const std::string e = "omnivoice rknn_open engine requires aarch64";
+    return e;
+}
+void Engine::set_layer_hook(void (*)(int, void*), void*) {}
+const uint16_t* Engine::dbg_q16() const { return nullptr; }
+const uint16_t* Engine::dbg_k16() const { return nullptr; }
+const uint16_t* Engine::dbg_ctxh() const { return nullptr; }
+const float* Engine::dbg_h() const { return nullptr; }
+float Engine::dbg_p(int, int) const { return 0.0f; }
+
+}  // namespace ovs
+
+#endif  // __aarch64__
 
 #endif  // ENGINE_HAVE_RKNN_OPEN

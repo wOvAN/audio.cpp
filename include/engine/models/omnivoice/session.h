@@ -106,6 +106,7 @@ private:
     // when the plan is ggml. Declared before generator_, which consumes it.
     std::vector<std::string> generator_rknn_engines_;
     bool generator_rknn_open_ = false;
+    bool generator_rknn_zeroop_ = false;
     OmniVoiceQwen3DiffusionRuntime generator_;
     OmniVoicePostprocessor postprocessor_;
     SessionDefaults session_defaults_;
